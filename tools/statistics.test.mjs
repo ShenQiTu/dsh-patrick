@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+import { summarize, presetRange, calendar, day } from '../src/stats.ts';
+const now = new Date(2026, 9, 13, 12).getTime();
+const call = (id, extra={}) => ({id,startedAt:now-1000,source:'gateway',state:'success',inputTokens:100,outputTokens:20,cacheReadTokens:40,cacheWriteTokens:0,...extra});
+let checks=0;
+function check(ok) { assert.ok(ok); checks++; }
+const rows = [call('one'),call('two',{cacheReadTokens:null}),call('test',{source:'test'}),call('old',{startedAt:now-40*day}),call('error',{state:'error',inputTokens:null,outputTokens:null,cacheReadTokens:null})];
+const s=summarize(rows,presetRange('hour',now));
+check(s.selected.length===3); check(s.input===200 && s.output===40); check(s.cacheRate===0.4); check(s.cacheSamples===1); check(s.failed===1 && s.success===2);
+check(s.buckets.reduce((n,b)=>n+b.input+b.output+b.read+b.write,0)===240);
+check(summarize(rows,presetRange('hour',now),'test').selected.length===1);
+check(summarize(rows,presetRange('hour',now),'all').selected.length===4);
+check(summarize([],presetRange('hour',now)).cacheRate===null);
+check(summarize([call('no-cache',{cacheReadTokens:null})],presetRange('hour',now)).cacheRate===null);
+check(summarize([call('zero',{cacheReadTokens:0})],presetRange('hour',now)).cacheRate===0);
+check(summarize([call('boundary',{startedAt:now})],presetRange('hour',now)).selected.length===0);
+check(presetRange('today',now).start===new Date(2026,9,13).getTime());
+check(new Date(presetRange('month',new Date(2026,2,31).getTime()).start).getDate()===28);
+const days=calendar(rows,now,'gateway'); check(days.length===365); check(days.reduce((n,d)=>n+d.count,0)===4);
+check(calendar(rows,now,'test').reduce((n,d)=>n+d.count,0)===1);
+console.log(`STATISTICS PASS checks=${checks} source_filter=OK cache_missing=UNKNOWN no_double_counting=OK calendar=LOCAL_TIME`);

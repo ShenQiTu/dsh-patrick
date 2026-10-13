@@ -1,0 +1,47 @@
+/* The dashboard shares the available height; no data section is clipped to fit. */
+.overview-main { display: flex; flex-direction: column; }
+.usage-overview { --activity-green: #38c45b; min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 10px; }
+.usage-overview > :not(.token-chart) { flex-shrink: 0; }
+.overview-range { white-space: nowrap; }
+.overview-range button { padding: 5px 7px; font-size: 12px; }
+.usage-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.usage-source { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.usage-source .select-control { width: 100px; }
+.usage-source .select-trigger { min-height: 28px; height: 28px; font-size: 12px; }
+.token-legend { display: flex; gap: 10px; color: var(--muted); font-size: 12px; }
+.token-legend span { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.token-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.token-chart { min-width: 0; min-height: 100px; flex: 1; display: flex; flex-direction: column; }
+.token-bars { display: flex; min-height: 70px; flex: 1; gap: 5px; align-items: stretch; position: relative; border-bottom: 1px solid var(--line-strong); padding: 0 5px; }
+.token-column { flex: 1; min-width: 0; background: var(--border); border-radius: 2px 2px 0 0; position: relative; }
+.token-stack { position: absolute; inset: 0; display: flex; flex-direction: column-reverse; justify-content: flex-start; }
+.token-stack i { display: block; flex-shrink: 0; }
+.token-input { background: #39a9f4; } .token-output { background: #1473e6; } .token-read { background: #38c45b; } .token-write { background: #b4a1ed; }
+.token-axis { display: flex; flex-shrink: 0; justify-content: space-between; gap: 4px; color: var(--muted); font-size: 12px; line-height: 18px; margin-top: 7px; }
+.token-axis span { white-space: nowrap; }
+.chart-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); text-align: center; margin: 0; color: var(--muted); background: var(--surface); padding: 7px 12px; white-space: nowrap; font-size: 13px; }
+.usage-metrics { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); height: 130px; border: 1px solid var(--line-strong); border-radius: 5px; }
+.usage-metrics section { min-width: 0; display: flex; flex-direction: column; justify-content: space-between; padding: 12px; border-right: 1px solid var(--line-strong); }
+.usage-metrics section:last-child { border: none; }
+.usage-metrics section > div:first-child { display: flex; gap: 5px; align-items: center; color: var(--muted); font-size: 13px; line-height: 18px; white-space: nowrap; }
+.usage-value { display: block; font-size: 23px; line-height: 28px; font-weight: 500; margin: auto 0 8px; }
+.usage-metrics small { display: block; color: var(--muted); font-size: 12px; line-height: 17px; }
+.cache-gauge { position: relative; width: 96px; max-width: 100%; margin: 2px auto; }
+.cache-gauge svg { display: block; width: 100%; }
+.cache-gauge path { fill: none; stroke-width: 10; stroke-linecap: round; }
+.gauge-track { stroke: var(--border); } .gauge-value { stroke: var(--activity-green); }
+.cache-gauge b { position: absolute; bottom: 6px; left: 0; right: 0; text-align: center; font-weight: 500; font-size: 18px; line-height: 22px; }
+.calendar-squares { display: grid; grid-template-rows: repeat(7,10px); grid-auto-flow: column; grid-auto-columns: minmax(0,1fr); gap: 2px; }
+.calendar-squares span { height: 10px; border-radius: 2px; background: var(--border); }
+.calendar-axis { display: flex; justify-content: space-between; margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 18px; }
+.custom-range { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; padding: 20px; }
+.custom-range label { min-width: 0; font-size: 13px; color: var(--muted); }
+.custom-range input { width: 100%; min-width: 0; margin-top: 6px; }
+.custom-range > p { grid-column: 1 / -1; color: var(--red); font-size: 13px; }
+.custom-range footer { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 850px) {
+  .overview-range button { padding: 5px 4px; }
+  .usage-metrics section { padding: 12px 9px; }
+  .usage-metrics section > div:first-child { font-size: 13px; gap: 3px; }
+  .token-legend { gap: 7px; }
+}

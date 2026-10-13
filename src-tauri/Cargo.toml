@@ -1,0 +1,28 @@
+[package]
+name = "dsh-patrick"
+version = "0.1.5"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream", "gzip", "brotli", "deflate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+futures-util = "0.3"
+getrandom = "0.3"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

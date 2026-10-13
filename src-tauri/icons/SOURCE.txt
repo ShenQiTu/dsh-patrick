@@ -1,0 +1,6 @@
+User-supplied artwork: a generated illustration of Patrick riding a blue whale.
+Original PNG SHA256: d6ccdbb27a710d76a70698ea843829a9c5c1179175f8fc55b4cecb5aa47c84ec
+The full-size original is retained locally and excluded from the publication set.
+Windows ICO and PNG sizes were generated with the Tauri CLI icon command.
+Artwork content was not edited. Alpha transparency is retained.
+This provenance note does not grant rights to third-party characters or brands.

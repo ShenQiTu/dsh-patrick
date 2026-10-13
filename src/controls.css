@@ -1,0 +1,131 @@
+/* Shared controls: one menu/tooltip system for all gateway forms. */
+.select-control {
+  min-width: 0;
+  width: 100%;
+}
+.select-trigger {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  justify-content: space-between;
+  font-size: 13px;
+}
+.select-trigger > span {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.select-trigger > svg {
+  flex-shrink: 0;
+}
+.choice-menu {
+  z-index: 20000;
+  margin: 0;
+  padding: 4px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  box-shadow: 0 5px 18px #0003;
+  color: var(--text);
+}
+.choice-menu button {
+  display: flex;
+  width: 100%;
+  text-align: left;
+  justify-content: flex-start;
+  min-height: 30px;
+  border: 0;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.choice-menu button > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.choice-menu button[data-active] {
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+.choice-menu button[aria-selected="true"] {
+  font-weight: 600;
+}
+.choice-empty {
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: normal;
+}
+.ui-tooltip {
+  z-index: 20001;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  box-shadow: 0 5px 18px #0003;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  overflow: auto;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
+.field-help {
+  display: inline-flex;
+  vertical-align: middle;
+  align-items: center;
+  justify-content: center;
+}
+.field-help:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.editor-error {
+  flex-shrink: 0;
+  margin: 0;
+  border-width: 0 0 1px;
+  border-radius: 0;
+  padding: 9px 18px;
+  max-height: 84px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.preset-row button.active {
+  color: var(--blue);
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+[data-theme="dark"] .preset-monochrome {
+  filter: brightness(0) invert(1);
+}
+.calls-filters .select-control {
+  width: 130px;
+  flex-shrink: 0;
+}
+.calls-filters .search {
+  min-width: 0;
+}
+.modal-head > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.modal-head > button {
+  flex-shrink: 0;
+}
+.activity-row > .state-tag {
+  flex-shrink: 0;
+}
+@media (max-width: 860px) {
+  .calls-filters .select-control {
+    width: 110px;
+  }
+}

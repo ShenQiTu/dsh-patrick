@@ -2,6 +2,80 @@ use super::*;
 use crate::config::ModelInput;
 
 #[tokio::test]
+async fn call_history_opt_in_restart_and_actual_wire_details() {
+    for protocol in ["openai","responses","anthropic"] {
+        let f=Fixture::new(protocol).await;
+        let first=f.engine.test(&f.id()).await.unwrap();
+        assert!(!first.info.detailed);
+        assert!(f.engine.call_detail(&first.id).unwrap()["payload"].is_null());
+        let mut settings=f.engine.config().unwrap().settings;settings.detailed_logging=true;
+        f.engine.save_settings(settings).unwrap();
+        let r=f.engine.test(&f.id()).await.unwrap();
+        assert_eq!(r.state,"success");assert!(r.info.ttfb_ms.is_some());
+        assert_eq!(r.info.model.as_deref(),Some("mock-model"));
+        assert!(r.info.request_url.as_ref().unwrap().ends_with(crate::protocol::endpoint(protocol)));
+        let detail=f.engine.call_detail(&r.id).unwrap();
+        assert_eq!(detail["payload"]["body"]["model"],"mock-model");
+        assert!(detail["payload"]["response"].as_str().unwrap().contains("data:"));
+        assert!(detail["payload"]["responseChunks"].as_u64().unwrap()>0);
+        let text=detail.to_string();assert!(!text.contains("UNIT_TEST_UPSTREAM_KEY") && !text.contains("fixture-value"));
+        let actual=f.mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(actual.body["model"],detail["payload"]["body"]["model"]);
+        let reopened=Gateway::new(f.engine.store.clone()).unwrap();
+        assert_eq!(reopened.runtime().unwrap().calls.len(),2);
+        assert_eq!(reopened.call_detail(&r.id).unwrap()["payload"],detail["payload"]);
+        assert!(reopened.runtime().unwrap().calls.iter().all(|r|r.preview.is_empty()));
+        drop(reopened);
+        let stats=f.engine.statistics().unwrap().len();
+        f.engine.clear_call_details().unwrap();
+        assert_eq!(f.engine.runtime().unwrap().calls.len(),2);
+        assert_eq!(f.engine.statistics().unwrap().len(),stats);
+        assert!(f.engine.call_detail(&r.id).unwrap()["payload"].is_null());
+        f.engine.clear_records().unwrap();
+        assert_eq!(f.engine.statistics().unwrap().len(),stats);
+        assert!(Gateway::new(f.engine.store.clone()).unwrap().runtime().unwrap().calls.is_empty());
+        f.cleanup().await;
+    }
+    println!("CALL_WIRE_PASS protocols=3 opt_in=YES actual_model=YES actual_request=YES keys=MASKED restart=PRESERVED details_clear=SUMMARY_UNCHANGED calls_clear=STATS_UNCHANGED");
+}
+
+#[tokio::test]
+async fn statistics_clear_is_idle_only_atomic_and_preserves_configuration() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f=Fixture::new("openai").await;
+    assert_eq!(f.engine.test(&f.id()).await.unwrap().state,"success");
+    let config=std::fs::read(f.directory.join("config.dpapi")).unwrap();
+    let path=f.directory.join("usage.dpapi");
+    let history=std::fs::read(&path).unwrap();
+    let before=f.engine.statistics_storage().unwrap();
+    assert_eq!(before["calls"],1); assert!(before["bytes"].as_u64().unwrap()>0);
+    for pending in [false,true] {
+        let count=if pending {&f.engine.pending} else {&f.engine.active};
+        count.fetch_add(1,Ordering::SeqCst);
+        assert!(f.engine.clear_statistics().is_err());
+        count.fetch_sub(1,Ordering::SeqCst);
+        assert_eq!(std::fs::read(&path).unwrap(),history);
+    }
+    let reader=std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+    assert!(f.engine.clear_statistics().is_err()); drop(reader);
+    assert_eq!(f.engine.statistics_storage().unwrap()["calls"],1);
+    assert_eq!(f.engine.runtime().unwrap().calls.len(),1);
+    assert_eq!(std::fs::read(&path).unwrap(),history);
+    let version=f.engine.runtime().unwrap().history_version;
+    f.engine.clear_statistics().unwrap();
+    assert_eq!(f.engine.statistics_storage().unwrap()["calls"],0);
+    assert_eq!(crate::history::History::open(path).records().len(),0);
+    let runtime=f.engine.runtime().unwrap();
+    assert!(runtime.calls.is_empty() && runtime.test_results.is_empty());
+    assert!(runtime.history_version>version);
+    assert_eq!(std::fs::read(f.directory.join("config.dpapi")).unwrap(),config);
+    assert_eq!(f.engine.test(&f.id()).await.unwrap().state,"success");
+    assert_eq!(f.engine.statistics_storage().unwrap()["calls"],1);
+    f.cleanup().await;
+    println!("STORAGE_PASS active_pending=REJECTED write_failure=PRESERVED cleared_on_disk=YES config_bytes=UNCHANGED next_request=SUCCESS");
+}
+
+#[tokio::test]
 async fn zen_presence_is_reported_even_when_upstream_rejects() {
     let f = Fixture::new("openai").await;
     let port = f.engine.start_at(0).await.unwrap();
@@ -140,7 +214,7 @@ async fn disconnect_admission_gate_and_anthropic_sdk_query() {
     let client=reqwest::Client::new();
     let pause=f.engine.pause_if_idle().unwrap();
     let r=client.post(format!("http://127.0.0.1:{port}/v1/messages?beta=true")).bearer_auth(f.token()).json(&body).send().await.unwrap();
-    assert_eq!(r.status(),429);assert!(f.mock.seen.lock().unwrap().is_empty());
+    assert_eq!(r.status(),503);assert!(f.mock.seen.lock().unwrap().is_empty());
     drop(pause);
     let r=client.post(format!("http://127.0.0.1:{port}/v1/messages?beta=true")).bearer_auth(f.token()).header("x-dsh-patrick","1").json(&body).send().await.unwrap();
     assert_eq!(r.status(),200);r.text().await.unwrap();
@@ -255,6 +329,7 @@ async fn mock_upstream(State(state): State<Mock>, request: Request) -> Response 
         .into_response();
     }
     let model = value.get("model").and_then(Value::as_str).unwrap_or("");
+    if let Some(response) = idle_mock(model, parts.uri.path()) { return response; }
     if model == "retry-once" && state.seen.lock().unwrap().iter().filter(|r| r.body["model"] == "retry-once").count() == 1 {
         return (StatusCode::SERVICE_UNAVAILABLE, "synthetic transient failure").into_response();
     }
@@ -550,8 +625,10 @@ impl Fixture {
         self.engine.stop().await.unwrap();
         self.server.abort();
         let directory = self.directory.clone();
+        self.engine.clear_records().unwrap();
         drop(self);
-        for name in ["config.dpapi", "instance.lock", "usage.dpapi"] {
+        if directory.join("call-details").exists() {std::fs::remove_dir(directory.join("call-details")).unwrap();}
+        for name in ["config.dpapi", "instance.lock", "usage.dpapi", "calls.dpapi"] {
             if directory.join(name).exists() { std::fs::remove_file(directory.join(name)).unwrap(); }
         }
         std::fs::remove_dir(directory).unwrap();
@@ -996,7 +1073,8 @@ async fn long_context_over_two_mib_and_configurable_limit() {
     .await;
     assert_eq!(response.status(), 413);
     assert_eq!(fixture.mock.seen.lock().unwrap().len(), 1);
-    let permits = fixture.engine.body_slots.acquire_many(2).await.unwrap();
+    let permits = fixture.engine.body_slots.clone().acquire_many_owned(16).await.unwrap();
+    tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(30)).await; drop(permits); });
     let response = client
         .post(&url)
         .bearer_auth(fixture.token())
@@ -1004,8 +1082,8 @@ async fn long_context_over_two_mib_and_configurable_limit() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 429);
-    drop(permits);
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
     fixture.cleanup().await;
 }
 
@@ -1105,14 +1183,16 @@ async fn test_failure_reasons_and_timeout_release_test_slot() {
         ("diag-length", 200, "length"),
         ("diag-malformed", 200, "数据格式无效"),
         ("truncated", 200, "缺少模型结束事件"),
-        ("timeout-headers", 0, "连接上游超时"),
-        ("timeout-body", 200, "读取上游响应超时"),
+        ("timeout-headers", 0, "本机等待响应头超时"),
+        ("timeout-body", 200, "本机流式空闲超时"),
     ] {
         {
             let mut store = f.engine.store.lock().unwrap();
             store.config.models[0].model = name.into();
             store.config.models[0].zen_test_enabled = true;
             store.config.settings.timeout_seconds = 1;
+            store.config.settings.stream_idle_seconds = 1;
+            store.config.settings.stream_grace_seconds = 0;
         }
         let result = f.engine.test(&f.id()).await.unwrap();
         assert_eq!(result.state, "error", "{name}");
@@ -1154,4 +1234,325 @@ fn test_stream_terminal_cases_and_auth_redaction() {
         assert!(!redact_reason(message, &[]).contains("UNKNOWN"));
     }
     assert!(redact_reason(&"x".repeat(900), &[]).len() <= 500);
+}
+
+async fn wait_queue_condition(check: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !check() { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.expect("queue state reached within five seconds");
+}
+
+fn local_request(f: &Fixture) -> tokio::task::JoinHandle<(StatusCode, String)> {
+    let port = f.engine.port.load(Ordering::SeqCst);
+    let token = f.token();
+    let body = json!({"model":f.id(),"messages":[{"role":"user","content":"SYNTHETIC_QUEUE_TEST"}],"stream":true});
+    tokio::spawn(async move {
+        let response = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build().unwrap()
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .bearer_auth(token).json(&body).send().await.unwrap();
+        (response.status(), response.text().await.unwrap())
+    })
+}
+
+#[tokio::test]
+async fn configurable_concurrency_bounds_migration_persistence_and_idle_apply() {
+    let f = Fixture::new("openai").await;
+    let settings = f.engine.config().unwrap().settings;
+    assert_eq!((settings.body_concurrency, settings.upstream_concurrency), (16,32));
+    let mut legacy = serde_json::to_value(&settings).unwrap();
+    legacy.as_object_mut().unwrap().remove("bodyConcurrency");
+    legacy.as_object_mut().unwrap().remove("upstreamConcurrency");
+    let migrated: crate::config::Settings = serde_json::from_value(legacy).unwrap();
+    assert_eq!((migrated.body_concurrency, migrated.upstream_concurrency), (16,32));
+    for (body,upstream,valid) in [(0,32,false),(17,32,false),(16,0,false),(16,33,false),(1,1,true),(8,20,true),(16,32,true)] {
+        let mut input = settings.clone();input.body_concurrency=body;input.upstream_concurrency=upstream;
+        assert_eq!(input.validate().is_ok(),valid);
+        if valid {
+            f.engine.save_settings(input).unwrap();
+            assert_eq!((f.engine.body_slots.available_permits(),f.engine.slots.available_permits()),(body,upstream));
+            let saved: Config = serde_json::from_slice(&crate::vault::read(&f.directory.join("config.dpapi")).unwrap()).unwrap();
+            assert_eq!((saved.settings.body_concurrency,saved.settings.upstream_concurrency),(body,upstream));
+            let reopened=Gateway::new(f.engine.store.clone()).unwrap();
+            assert_eq!((reopened.body_slots.available_permits(),reopened.slots.available_permits()),(body,upstream));
+        } else { assert!(f.engine.save_settings(input).is_err()); }
+    }
+    let pending=PendingRequest::new(&f.engine).unwrap();
+    let mut changed=settings.clone();changed.body_concurrency=8;
+    assert!(f.engine.save_settings(changed).unwrap_err().contains("空闲"));
+    assert!(f.engine.pause_if_idle().is_err());
+    assert!(f.engine.stop().await.is_err());
+    drop(pending);
+    assert_eq!(f.engine.config().unwrap().settings.body_concurrency,16);
+    println!("SETTINGS_PASS ranges=1..16/1..32 defaults=16/32 legacy=PASS encrypted_persistence=PASS idle_apply=PASS busy_rejected=PASS");
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn sixteen_slow_bodies_seventeenth_waits_then_resumes() {
+    let f=Fixture::new("openai").await;
+    let port=f.engine.start_at(0).await.unwrap();
+    let mut releases=vec![];let mut tasks=vec![];
+    for _ in 0..16 {
+        let (release,wait)=oneshot::channel::<()>();releases.push(release);
+        let body=json!({"model":f.id(),"messages":[],"stream":true}).to_string();
+        let rest=body.as_bytes()[1..].to_vec();
+        let token=f.token();
+        tasks.push(tokio::spawn(async move {
+            let chunks=stream::once(async { Ok::<_,std::io::Error>(vec![b'{']) }).chain(stream::once(async move {
+                wait.await.unwrap();Ok::<_,std::io::Error>(rest)
+            }));
+            let r=reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap()
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .bearer_auth(token).header("content-type","application/json")
+                .body(reqwest::Body::wrap_stream(chunks)).send().await.unwrap();
+            assert_eq!(r.status(),200);assert!(r.text().await.unwrap().contains("Hello mock"));
+        }));
+    }
+    wait_queue_condition(||f.engine.body_slots.available_permits()==0).await;
+    assert_eq!(f.engine.slots.available_permits(),32);
+    let seventeenth=local_request(&f);
+    wait_queue_condition(||f.engine.body_queue.available_permits()==127).await;
+    assert!(!seventeenth.is_finished());assert!(f.mock.seen.lock().unwrap().is_empty());
+    releases.pop().unwrap().send(()).unwrap();
+    let (status,body)=seventeenth.await.unwrap();assert_eq!(status,200);assert!(body.contains("Hello mock"));
+    for release in releases {release.send(()).unwrap();}
+    for task in tasks {task.await.unwrap();}
+    wait_queue_condition(||f.engine.pending.load(Ordering::SeqCst)==0 && f.engine.active.load(Ordering::SeqCst)==0).await;
+    assert_eq!((f.engine.body_slots.available_permits(),f.engine.body_queue.available_permits()),(16,128));
+    println!("BODY_QUEUE_PASS simultaneous_uploads=16 request17=WAIT_THEN_200 released=16/128 upstream_unchanged=32");
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn upstream_queue_shared_by_proxy_tests_discovery_and_cancel() {
+    let f=Fixture::new("openai").await;f.engine.start_at(0).await.unwrap();
+    let held=f.engine.slots.clone().acquire_many_owned(32).await.unwrap();
+    let proxy=local_request(&f);
+    wait_queue_condition(||f.engine.upstream_queue.available_permits()==127).await;
+    assert_eq!(f.engine.body_slots.available_permits(),15,"parsed body retains its memory-admission permit");
+    let id=f.id();let e=f.engine.clone();
+    let test=tokio::spawn(async move {e.test(&id).await});
+    let model=f.engine.config().unwrap().models[0].clone();
+    let input:ModelInput=serde_json::from_value(serde_json::to_value(model).unwrap()).unwrap();
+    let e=f.engine.clone();let discover=tokio::spawn(async move {e.discover(input,None).await});
+    wait_queue_condition(||f.engine.upstream_queue.available_permits()==125).await;
+    assert!(!proxy.is_finished() && !test.is_finished() && !discover.is_finished());
+    assert!(f.engine.pause_if_idle().is_err());assert!(f.engine.stop().await.is_err());
+    f.engine.cancel_test(&f.id()).unwrap();assert!(test.await.unwrap().err().unwrap().contains("取消"));
+    assert_eq!(f.engine.upstream_queue.available_permits(),126);
+    drop(held);
+    assert_eq!(proxy.await.unwrap().0,200);assert_eq!(discover.await.unwrap().unwrap().len(),2);
+    wait_queue_condition(||f.engine.pending.load(Ordering::SeqCst)==0 && f.engine.active.load(Ordering::SeqCst)==0).await;
+    assert_eq!((f.engine.body_slots.available_permits(),f.engine.slots.available_permits(),f.engine.upstream_queue.available_permits()),(16,32,128));
+    println!("UPSTREAM_QUEUE_PASS limit=32 proxy=WAIT_THEN_200 discovery=WAIT_THEN_OK cancelled_test=RELEASED memory_bound=PASS");
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn queue_fifo_capacity_timeout_and_aborted_future_release() {
+    let slots=Arc::new(Semaphore::new(1));let queue=Arc::new(Semaphore::new(128));
+    let held=slots.clone().acquire_owned().await.unwrap();
+    let s=slots.clone();let q=queue.clone();
+    let cancelled=tokio::spawn(async move {queued_permit(&s,&q,tokio::time::Instant::now()+Duration::from_secs(5),"模型转发").await});
+    wait_queue_condition(||queue.available_permits()==127).await;cancelled.abort();assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert_eq!(queue.available_permits(),128);
+    let error=queued_permit(&slots,&queue,tokio::time::Instant::now()+Duration::from_millis(20),"请求体处理").await.unwrap_err();
+    assert_eq!(error.0,504);assert!(error.1.contains("排队等待超时"));assert_eq!(queue.available_permits(),128);
+    let all_waiters=queue.acquire_many(128).await.unwrap();
+    assert_eq!(queued_permit(&slots,&queue,tokio::time::Instant::now()+Duration::from_secs(5),"请求体处理").await.unwrap_err().0,429);
+    drop(all_waiters);
+    let order=Arc::new(Mutex::new(vec![]));let mut tasks=vec![];
+    for index in 0..3 {
+        let s=slots.clone();let q=queue.clone();let o=order.clone();
+        tasks.push(tokio::spawn(async move {
+            let _p=queued_permit(&s,&q,tokio::time::Instant::now()+Duration::from_secs(5),"模型转发").await.unwrap();o.lock().unwrap().push(index);
+        }));
+        wait_queue_condition(||queue.available_permits()==127-index).await;
+    }
+    drop(held);for t in tasks {t.await.unwrap();}
+    assert_eq!(*order.lock().unwrap(),vec![0,1,2]);assert_eq!((slots.available_permits(),queue.available_permits()),(1,128));
+    println!("QUEUE_LIFECYCLE_PASS fifo=0,1,2 full=429 timeout=504 cancellation=RELEASED all_permits_restored=YES");
+}
+
+#[tokio::test]
+async fn http_queue_timeout_releases_body_and_pending_at_both_stages() {
+    let f=Fixture::new("openai").await;f.engine.start_at(0).await.unwrap();
+    // Accelerate only this in-memory fixture; persistent settings still enforce 5..600 seconds.
+    f.engine.store.lock().unwrap().config.settings.timeout_seconds=1;
+    for body_stage in [true,false] {
+        let held=if body_stage {f.engine.body_slots.clone().acquire_many_owned(16).await.unwrap()}
+            else {f.engine.slots.clone().acquire_many_owned(32).await.unwrap()};
+        let (status,message)=local_request(&f).await.unwrap();
+        assert_eq!(status,504);assert!(message.contains(if body_stage {"请求体处理排队等待超时"} else {"模型转发排队等待超时"}));
+        assert_eq!(f.engine.pending.load(Ordering::SeqCst),0);assert!(f.mock.seen.lock().unwrap().is_empty());
+        drop(held);
+        assert_eq!((f.engine.body_slots.available_permits(),f.engine.slots.available_permits()),(16,32));
+    }
+    assert_eq!(local_request(&f).await.unwrap().0,200);
+    println!("HTTP_TIMEOUT_PASS body=504 upstream=504 no_upstream_sent=YES next_request=200 released=16/32");
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn synthetic_bursts_respect_configured_upstream_limit_and_queue() {
+    let f=Fixture::new("openai").await;f.engine.start_at(0).await.unwrap();
+    f.engine.store.lock().unwrap().config.models[0].model="slow".into();
+    for (count,body_limit,upstream_limit) in [(10,16,32),(20,16,32),(30,16,32),(99,16,32),(30,8,20)] {
+        let mut settings=f.engine.config().unwrap().settings;settings.body_concurrency=body_limit;settings.upstream_concurrency=upstream_limit;
+        f.engine.save_settings(settings).unwrap();
+        let tasks:Vec<_>=(0..count).map(|_|local_request(&f)).collect();let mut maximum=0;
+        while tasks.iter().any(|t|!t.is_finished()) {
+            let active=f.engine.active.load(Ordering::SeqCst);maximum=maximum.max(active);assert!(active<=upstream_limit);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for task in tasks {let (status,body)=task.await.unwrap();assert_eq!(status,200);assert!(body.contains("Hello mock"));assert!(body.contains("[DONE]"));}
+        assert_eq!(maximum,upstream_limit.min(count));
+        assert_eq!(f.engine.pending.load(Ordering::SeqCst),0);
+        println!("BURST_PASS input={count} body_limit={body_limit} upstream_limit={upstream_limit} completed={count} max_active={maximum} rejected=0 synthetic_loopback=YES");
+    }
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn client_disconnect_removes_waiters_at_both_stages() {
+    let f=Fixture::new("openai").await;f.engine.start_at(0).await.unwrap();
+    for body_stage in [true,false] {
+        let held=if body_stage {f.engine.body_slots.clone().acquire_many_owned(16).await.unwrap()}
+            else {f.engine.slots.clone().acquire_many_owned(32).await.unwrap()};
+        let request=local_request(&f);
+        let queue=if body_stage {&f.engine.body_queue} else {&f.engine.upstream_queue};
+        wait_queue_condition(||queue.available_permits()==127).await;
+        request.abort();assert!(request.await.unwrap_err().is_cancelled());
+        wait_queue_condition(||f.engine.pending.load(Ordering::SeqCst)==0).await;
+        assert_eq!(queue.available_permits(),128);assert!(f.mock.seen.lock().unwrap().is_empty());
+        drop(held);
+    }
+    assert_eq!(local_request(&f).await.unwrap().0,200);
+    println!("HTTP_DISCONNECT_PASS body_waiter=REMOVED upstream_waiter=REMOVED no_replay=YES next_request=200");
+    f.cleanup().await;
+}
+
+// Synthetic upstream: regular chunks, heartbeat-only waits, silence and a real 615-second stream.
+fn idle_mock(model: &str, path: &str) -> Option<Response> {
+    let (count, interval, heartbeat, terminal) = match model {
+        "idle-active" => (8, 250, false, true),
+        "idle-heartbeat" => (8, 250, true, true),
+        "idle-empty-heartbeat" => (8, 250, true, false),
+        "idle-long" => (124, 5000, false, true),
+        _ => return None,
+    };
+    let (chunk, end) = if path.ends_with("/messages") {
+        ("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n", "data: {\"type\":\"message_stop\"}\n\n")
+    } else if path.ends_with("/responses") {
+        ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n", "data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+    } else {
+        ("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n", "data: [DONE]\n\n")
+    };
+    let stream = stream::unfold(0, move |i| async move {
+        if i > count { return None; }
+        if i > 0 && i < count {tokio::time::sleep(Duration::from_millis(interval)).await;}
+        let text = if i == count {
+            if terminal {format!("{chunk}{end}")} else {String::new()}
+        } else if heartbeat {": keep-alive\n\n".to_owned()} else {chunk.to_owned()};
+        Some((Ok::<_,std::io::Error>(text),(i+1)))
+    });
+    Some(([("content-type","text/event-stream")],Body::from_stream(stream)).into_response())
+}
+
+#[tokio::test]
+async fn stream_idle_repro_active_stream_outlives_old_total() {
+    let f=Fixture::new("openai").await;
+    {let mut store=f.engine.store.lock().unwrap();store.config.settings.timeout_seconds=1;store.config.models[0].model="idle-active".into();}
+    let start=Instant::now();let result=f.engine.test(&f.id()).await.unwrap();
+    let elapsed=start.elapsed().as_millis();
+    println!("ACTIVE_STREAM_OBSERVED state={} elapsed_ms={} message={}",result.state,elapsed,result.message);
+    assert_eq!(result.state,"success","ACTIVE_STREAM_WAS_CUT_BY_TOTAL_TIMEOUT");
+    assert!(elapsed>1500);assert_eq!(f.mock.seen.lock().unwrap().len(),1);
+    f.cleanup().await;
+    println!("ACTIVE_STREAM_PASS continuous_output_exceeds_old_total=YES requests=1");
+}
+
+#[tokio::test]
+async fn stream_idle_proxy_heartbeat_three_protocols_and_nonstream_preserved() {
+    for proto in ["openai","responses","anthropic"] {
+        let f=Fixture::new(proto).await;let port=f.engine.start_at(0).await.unwrap();
+        {let mut s=f.engine.store.lock().unwrap();s.config.settings.timeout_seconds=1;s.config.settings.stream_idle_seconds=1;s.config.settings.stream_grace_seconds=0;s.config.models[0].model="idle-heartbeat".into();}
+        let model=f.engine.config().unwrap().models[0].clone();
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+        let request=protocol::test_body(&model);
+        let url=format!("http://127.0.0.1:{port}/v1/{}",protocol::endpoint(proto));
+        let r=client.post(&url).bearer_auth(f.token()).json(&request).send().await.unwrap();
+        assert_eq!(r.status(),200);let text=r.text().await.unwrap();assert!(text.contains("keep-alive") && text.contains("OK"));
+        wait_queue_condition(||f.engine.active.load(Ordering::SeqCst)==0).await;
+        assert_eq!(f.engine.runtime().unwrap().calls[0].state,"success");
+        assert_eq!(f.mock.seen.lock().unwrap().len(),1);
+        // A real non-stream request retains its old total response budget, even if a server returns SSE.
+        let mut request=request;request["stream"]=json!(false);
+        let r=client.post(&url).bearer_auth(f.token()).json(&request).send().await.unwrap();
+        assert!(r.text().await.is_err());
+        wait_queue_condition(||f.engine.active.load(Ordering::SeqCst)==0).await;
+        assert_eq!(f.engine.runtime().unwrap().calls[0].state,"error");
+        assert_eq!(f.engine.slots.available_permits(),32);
+        f.cleanup().await;
+    }
+    println!("STREAM_POLICY_PASS protocols=3 heartbeat_resets=YES nonstream_total=PRESERVED no_retries=YES slots=RELEASED");
+}
+
+#[tokio::test]
+async fn stream_idle_grace_errors_new_requests_and_cancel() {
+    let f=Fixture::new("openai").await;
+    {let mut s=f.engine.store.lock().unwrap();s.config.settings.timeout_seconds=1;s.config.settings.stream_idle_seconds=1;s.config.settings.stream_grace_seconds=2;}
+    // Two-second header wait succeeds with 1+2 seconds grace, despite the old 1-second total.
+    f.engine.store.lock().unwrap().config.models[0].model="timeout-headers".into();
+    assert_eq!(f.engine.test(&f.id()).await.unwrap().state,"success");
+    {let mut s=f.engine.store.lock().unwrap();s.config.settings.stream_grace_seconds=0;s.config.models[0].model="timeout-body".into();}
+    let start=Instant::now();let r=f.engine.test(&f.id()).await.unwrap();
+    assert_eq!(r.state,"error");assert_eq!(r.info.error_kind.as_deref(),Some("stream_idle_timeout"));
+    assert!(start.elapsed()>=Duration::from_millis(900) && start.elapsed()<Duration::from_secs(2));
+    assert_eq!(f.engine.slots.available_permits(),32);
+    f.engine.store.lock().unwrap().config.models[0].model="idle-empty-heartbeat".into();
+    let r=f.engine.test(&f.id()).await.unwrap();assert_eq!(r.state,"error");assert!(!r.message.starts_with("本机流式空闲超时"));
+    f.engine.store.lock().unwrap().config.models[0].model="stream-error".into();
+    let seen=f.mock.seen.lock().unwrap().len();let r=f.engine.test(&f.id()).await.unwrap();
+    assert_eq!(r.state,"error");assert_eq!(r.status,200);assert_eq!(f.mock.seen.lock().unwrap().len(),seen+1);
+    // A new independent call is not bound to any deadline from the previous error.
+    f.engine.store.lock().unwrap().config.models[0].model="idle-active".into();
+    assert_eq!(f.engine.test(&f.id()).await.unwrap().state,"success");
+    f.engine.store.lock().unwrap().config.models[0].model="idle-long".into();
+    let engine=f.engine.clone();let id=f.id();let task=tokio::spawn(async move {engine.test(&id).await});
+    wait_queue_condition(||f.engine.active.load(Ordering::SeqCst)==1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;f.engine.cancel_test(&f.id()).unwrap();
+    assert!(task.await.unwrap().err().unwrap().contains("取消"));
+    assert!(f.engine.tests.lock().unwrap().is_empty());assert_eq!(f.engine.slots.available_permits(),32);
+    assert_eq!(f.engine.active.load(Ordering::SeqCst),0);
+    f.cleanup().await;
+    println!("STREAM_ERRORS_PASS grace=HONORED silence=TIMEOUT heartbeat_only=NOT_SUCCESS sse_error=FAILED requests=NO_REPLAY new_timer=YES cancellation=RELEASED");
+}
+
+#[tokio::test]
+async fn stream_idle_empty_chunks_do_not_extend_deadline() {
+    let stream=stream::unfold(0,|i|async move {tokio::time::sleep(Duration::from_millis(50)).await;Some((Ok::<_,reqwest::Error>(Bytes::new()),i+1))});
+    let mut stream=Box::pin(stream);let start=Instant::now();
+    assert!(next_response_chunk(&mut stream,Some(1)).await.unwrap_err().contains("本机流式空闲超时"));
+    assert!(start.elapsed()<Duration::from_secs(2));
+    println!("EMPTY_CHUNKS_PASS idle_deadline=NOT_REFRESHED");
+}
+
+#[tokio::test]
+#[ignore = "explicit 615-second loopback-only soak; no real upstream"]
+async fn stream_idle_long_615_seconds() {
+    let f=Fixture::new("openai").await;let port=f.engine.start_at(0).await.unwrap();
+    {let mut s=f.engine.store.lock().unwrap();s.config.settings.timeout_seconds=610;s.config.models[0].model="idle-long".into();}
+    let model=f.engine.config().unwrap().models[0].clone();
+    let start=Instant::now();
+    let client=reqwest::Client::builder().timeout(Duration::from_secs(660)).build().unwrap();
+    let r=client.post(format!("http://127.0.0.1:{port}/v1/chat/completions")).bearer_auth(f.token()).json(&protocol::test_body(&model)).send().await.unwrap();
+    assert_eq!(r.status(),200);let text=r.text().await.unwrap();
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    wait_queue_condition(||f.engine.active.load(Ordering::SeqCst)==0).await;
+    assert_eq!(f.engine.runtime().unwrap().calls[0].state,"success");assert_eq!(f.mock.seen.lock().unwrap().len(),1);
+    let elapsed=start.elapsed().as_millis();assert!(elapsed>=615000);
+    assert_eq!(f.engine.slots.available_permits(),32);
+    f.cleanup().await;
+    println!("LONG_STREAM_PASS elapsed_ms={elapsed} old_total_seconds=610 actual_output_over_610=YES completed=DONE requests=1 slots=RELEASED loopback_only=YES");
 }

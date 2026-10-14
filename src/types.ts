@@ -30,11 +30,21 @@ export interface Settings {
   dshProfile: string;
   port: number;
   timeoutSeconds: number;
+  streamIdleSeconds: number;
+  streamGraceSeconds: number;
   maxBodyMb: number;
+  bodyConcurrency: number;
+  upstreamConcurrency: number;
   theme: "light" | "dark" | "system";
   logLimit: number;
+  detailedLogging: boolean;
 }
+export interface TokenPricing { input: number | null; output: number | null; cacheRead: number | null; cacheWrite: number | null }
+export interface AutostartStatus { enabled: boolean; currentExecutable: boolean }
+export interface StorageInfo { calls: number; bytes: number; historyError: string | null }
+export interface UpdateInfo { version: string; state: "available" | "current" | "ahead" }
 export interface Snapshot {
+  pricing: TokenPricing;
   models: Model[];
   settings: Settings;
   dataDirectory: string;
@@ -53,11 +63,21 @@ export interface Snapshot {
     testResults: Record<string, CallRecord>;
     historyVersion: number;
     historyError: string | null;
+    callError?: string | null;
   };
   testUpstream?: string | null;
   testPauseSeconds?: number;
 }
+export interface CallInfo {
+  model?: string | null; requestUrl?: string | null; reasoning?: string | null;
+  finishReason?: string | null; ttfbMs?: number | null; ttfrMs?: number | null;
+  reasoningTokens?: number | null; messageCount?: number | null; toolCount?: number | null;
+  errorKind?: string | null; detailed?: boolean; legacy?: boolean;
+}
+export interface CallPayload { headers: Record<string,string>; body: unknown; response: string; responseChunks: number; requestTruncated: boolean; responseTruncated: boolean }
+export interface CallDetail { record: CallRecord; payload: CallPayload | null }
 export interface CallRecord {
+  info?: CallInfo;
   id: string;
   modelId: string;
   name: string;

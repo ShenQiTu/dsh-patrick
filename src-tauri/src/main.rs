@@ -6,7 +6,11 @@ mod protocol;
 mod vault;
 mod lifecycle;
 mod history;
+mod call_history;
+mod desktop_settings;
 mod dsh;
+#[cfg(test)]
+mod exit_tests;
 
 use config::{ModelInput, ModelView, Settings, Store};
 use serde::Serialize;
@@ -23,6 +27,7 @@ struct AppState {
     gateway: Arc<gateway::Gateway>,
     directory: PathBuf,
     smoke: bool,
+    autostart_key: String,
     smoke_finished: std::sync::atomic::AtomicBool,
 }
 
@@ -49,7 +54,7 @@ impl AppState {
         let _pause=self.gateway.pause_if_idle()?;
         if !self.smoke {
             let profile=self.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
-            if std::path::Path::new(&profile).join(".dsh-patrick/journal.json").exists() { self.bridge("disconnect").await?; }
+            if dsh::owns_integration(&self.directory,&profile)? { self.bridge("disconnect").await?; }
             else { self.dsh.lock().map_err(|_| "接入状态锁异常")?.configured=false; }
         }
         self.gateway.stop().await
@@ -72,6 +77,7 @@ async fn check_dsh(state: tauri::State<'_, AppState>) -> Result<(), String> {
 struct Snapshot {
     models: Vec<ModelView>,
     settings: Settings,
+    pricing: config::TokenPricing,
     data_directory: String,
     app_version: String,
     test_mode: bool,
@@ -92,6 +98,7 @@ fn snapshot(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<Snap
     Ok(Snapshot {
         models: store.config.models.iter().map(|m| m.view()).collect(),
         settings: store.config.settings.clone(),
+        pricing: store.config.pricing.clone(),
         data_directory: state.directory.display().to_string(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         test_mode: state.smoke,
@@ -159,11 +166,7 @@ async fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) ->
     {
         return Err("修改监听端口前请先关闭网关".into());
     }
-    state
-        .store
-        .lock()
-        .map_err(|_| "配置锁异常")?
-        .settings(settings)
+    state.gateway.save_settings(settings)
 }
 
 #[tauri::command]
@@ -202,8 +205,34 @@ fn cancel_test(state: tauri::State<AppState>, id: String) -> Result<(), String> 
     state.gateway.cancel_test(&id)
 }
 #[tauri::command]
+fn call_detail(state: tauri::State<AppState>, id:String) -> Result<serde_json::Value,String> { state.gateway.call_detail(&id) }
+#[tauri::command]
+fn clear_call_details(state: tauri::State<AppState>) -> Result<(),String> { state.gateway.clear_call_details() }
+#[tauri::command]
 fn clear_records(state: tauri::State<AppState>) -> Result<(), String> {
     state.gateway.clear_records()
+}
+#[tauri::command]
+fn save_pricing(state: tauri::State<AppState>, pricing: config::TokenPricing) -> Result<(), String> {
+    state.store.lock().map_err(|_| "配置锁异常")?.pricing(pricing)
+}
+#[tauri::command]
+fn statistics_storage(state: tauri::State<AppState>) -> Result<serde_json::Value, String> { state.gateway.statistics_storage() }
+#[tauri::command]
+fn clear_statistics(state: tauri::State<AppState>) -> Result<(), String> { state.gateway.clear_statistics() }
+#[tauri::command]
+fn autostart_status(state: tauri::State<AppState>) -> Result<desktop_settings::AutostartStatus, String> { desktop_settings::autostart_status(&state.autostart_key) }
+#[tauri::command]
+fn set_autostart(state: tauri::State<AppState>, enabled: bool) -> Result<desktop_settings::AutostartStatus, String> { desktop_settings::set_autostart(&state.autostart_key, enabled) }
+#[tauri::command]
+async fn check_update(state: tauri::State<'_, AppState>) -> Result<desktop_settings::UpdateInfo, String> {
+    if state.smoke { return Err("自测模式不访问 GitHub；仓库未公开时将提示登录发布页查看".into()); }
+    desktop_settings::check_update().await
+}
+#[tauri::command]
+fn open_release_page(state: tauri::State<AppState>) -> Result<(), String> {
+    if state.smoke { return Err("自测模式不打开外部浏览器".into()); }
+    desktop_settings::open_release_page()
 }
 #[tauri::command]
 fn gateway_token(state: tauri::State<AppState>) -> Result<String, String> {
@@ -302,6 +331,7 @@ fn smoke_finish(state: tauri::State<AppState>, checks: Vec<String>) -> Result<()
         serde_json::to_vec_pretty(&result).map_err(|_| "自测序列化失败")?,
     )
     .map_err(|_| "自测报告写入失败")?;
+    desktop_settings::cleanup_test_key(&state.autostart_key);
     state.smoke_finished.store(true, std::sync::atomic::Ordering::SeqCst);
     // The UI smoke then clicks the real custom close button. The process timeout
     // detects a missing handler instead of silently closing the window for it.
@@ -320,6 +350,7 @@ fn smoke_fail(
     let target = std::env::var("DSH_PATRICK_SMOKE_RESULT").map_err(|_| "缺少自测结果路径")?;
     let result = serde_json::json!({"status":"FAIL","message":message});
     std::fs::write(target, result.to_string()).map_err(|_| "写入自测报告失败")?;
+    desktop_settings::cleanup_test_key(&state.autostart_key);
     app.exit(1);
     Ok(())
 }
@@ -355,11 +386,11 @@ fn main() {
     }
     let visual_review = smoke && std::env::var("DSH_PATRICK_SMOKE_SHOW").as_deref() == Ok("1");
     let result=tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,test_model,cancel_test,clear_records,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
+        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,test_model,cancel_test,clear_records,call_detail,clear_call_details,save_pricing,statistics_storage,clear_statistics,autostart_status,set_autostart,check_update,open_release_page,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
         .setup(move|app|{
             let store=Arc::new(Mutex::new(Store::open(directory.clone()).map_err(std::io::Error::other)?));
             let gateway=gateway::Gateway::new(store.clone()).map_err(std::io::Error::other)?;
-            app.manage(AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),store,gateway,directory,smoke,smoke_finished: std::sync::atomic::AtomicBool::new(false)});
+            app.manage(AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),store,gateway,directory,smoke,autostart_key:if smoke {desktop_settings::test_key()} else {desktop_settings::STARTUP_KEY.into()},smoke_finished: std::sync::atomic::AtomicBool::new(false)});
             tauri::WebviewWindowBuilder::new(app,"main",tauri::WebviewUrl::App("index.html".into()))
                 .title(if visual_review{format!("DSH Patrick v{} — 本机模拟验证",env!("CARGO_PKG_VERSION"))}else{format!("DSH Patrick v{}",env!("CARGO_PKG_VERSION"))}).inner_size(960.0,640.0).min_inner_size(800.0,520.0)
                 .decorations(false).visible(!smoke||visual_review).data_directory(webview)

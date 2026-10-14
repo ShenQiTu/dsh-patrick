@@ -214,6 +214,9 @@ pub fn outgoing_headers(model: &Model, incoming: &HeaderMap) -> Result<HeaderMap
 
 #[derive(Default)]
 pub struct Metrics {
+    pub first_valid_ms: Option<u64>,
+    pub finish_reason: Option<String>,
+    pub reasoning_tokens: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -249,11 +252,21 @@ impl Metrics {
         {
             self.completed = true;
         }
+        if let Some(reason)=value.pointer("/choices/0/finish_reason").or_else(||value.pointer("/delta/stop_reason")).and_then(Value::as_str) {
+            self.finish_reason=Some(reason.chars().take(100).collect());
+        } else if kind=="response.completed" {self.finish_reason=Some("completed".into());}
+        let has_content=value.pointer("/choices/0/delta/content").and_then(Value::as_str).is_some_and(|s|!s.is_empty())
+            || value.pointer("/choices/0/delta/reasoning_content").and_then(Value::as_str).is_some_and(|s|!s.is_empty())
+            || value.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array).is_some_and(|s|!s.is_empty())
+            || value.pointer("/choices/0/message").is_some()
+            || matches!(kind,"content_block_start"|"content_block_delta"|"response.output_text.delta"|"response.reasoning_summary_text.delta"|"response.function_call_arguments.delta");
+        if has_content {self.first_valid_ms.get_or_insert(elapsed);}
         let root = value
             .get("response")
             .or_else(|| value.get("message"))
             .unwrap_or(value);
         if let Some(usage) = root.get("usage").or_else(|| value.get("usage")) {
+            if let Some(n)=usage.pointer("/completion_tokens_details/reasoning_tokens").or_else(||usage.pointer("/output_tokens_details/reasoning_tokens")).and_then(Value::as_u64) {self.reasoning_tokens=Some(n);}
             let cache_read = usage.pointer("/prompt_tokens_details/cached_tokens")
                 .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
                 .or_else(|| usage.get("cache_read_input_tokens"))

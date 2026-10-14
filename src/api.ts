@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type {
   CallRecord,
+  AutostartStatus, StorageInfo, TokenPricing, UpdateInfo,
   Model,
   ModelInput,
   Settings,
@@ -11,16 +12,22 @@ export const native = isTauri();
 // Browser preview is explicitly labelled and memory-only. It never calls an upstream or persists credentials.
 let preview: Snapshot = {
   models: [],
+  pricing: {input:null,output:null,cacheRead:null,cacheWrite:null},
   settings: {
     port: 8787,
     dshProfile: "",
     timeoutSeconds: 120,
+    streamIdleSeconds: 600,
+    streamGraceSeconds: 10,
     maxBodyMb: 64,
+    bodyConcurrency: 16,
+    upstreamConcurrency: 32,
     theme: "light",
     logLimit: 200,
+    detailedLogging: false,
   },
   dataDirectory: "浏览器预览 · 数据只保留在当前页面内存",
-  appVersion: "0.1.5",
+  appVersion: "0.1.7",
   testMode: false,
   gatewayRunning: false,
   gatewayAvailable: false,
@@ -31,6 +38,16 @@ let preview: Snapshot = {
 };
 const clone = <T>(x: T): T => structuredClone(x);
 export const api = {
+  savePricing: async (pricing: TokenPricing) => {
+    if (native) return invoke<void>("save_pricing", { pricing });
+    preview.pricing = clone(pricing);
+  },
+  autostartStatus: () => invoke<AutostartStatus>("autostart_status"),
+  setAutostart: (enabled: boolean) => invoke<AutostartStatus>("set_autostart", { enabled }),
+  checkUpdate: () => invoke<UpdateInfo>("check_update"),
+  openReleasePage: () => invoke<void>("open_release_page"),
+  statisticsStorage: () => native ? invoke<StorageInfo>("statistics_storage") : Promise.resolve({calls:0,bytes:0,historyError:null}),
+  clearStatistics: () => invoke<void>("clear_statistics"),
   statistics: () => native ? invoke<import("./stats").UsageRecord[]>("statistics") : Promise.resolve([]),
   snapshot: () =>
     native ? invoke<Snapshot>("snapshot") : Promise.resolve(clone(preview)),
@@ -150,5 +167,7 @@ export const api = {
   test: (id: string) => invoke<CallRecord>("test_model", { id }),
   cancel: (id: string) => invoke<void>("cancel_test", { id }),
   clearRecords: () => invoke<void>("clear_records"),
+  callDetail: (id: string) => invoke<import("./types").CallDetail>("call_detail", { id }),
+  clearCallDetails: () => invoke<void>("clear_call_details"),
   token: () => invoke<string>("gateway_token"),
 };

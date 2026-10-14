@@ -7,6 +7,8 @@ import "./network.css";
 import "./compact.css";
 import "./controls.css";
 import "./overview.css";
+import "./settings.css";
+import "./calls.css";
 
 createRoot(document.getElementById("root")!).render(<App />);
 if (native)

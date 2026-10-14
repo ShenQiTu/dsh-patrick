@@ -1,9 +1,9 @@
 use crate::{
-    config::{new_id, Config, Model, ModelInput, Store},
+    config::{new_id, Config, Model, ModelInput, Settings, Store},
     protocol::{self, Metrics},
 };
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -27,9 +27,47 @@ use tokio::{
 
 mod test_request;
 
-#[derive(Clone, Serialize, Deserialize)]
+const MAX_QUEUE_WAITERS: usize = 128;
+
+#[derive(Debug)]
+struct QueueError(StatusCode, String);
+
+// Tokio semaphore waiters are FIFO. A separate permit bounds the waiting list.
+// Dropping this future (cancellation/timeout) releases its queue permit.
+async fn queued_permit(
+    slots: &Arc<Semaphore>,
+    queue: &Semaphore,
+    deadline: tokio::time::Instant,
+    stage: &str,
+) -> Result<OwnedSemaphorePermit, QueueError> {
+    if let Ok(permit) = slots.clone().try_acquire_owned() { return Ok(permit); }
+    let _queued = queue.try_acquire().map_err(|_| QueueError(
+        StatusCode::TOO_MANY_REQUESTS, format!("{stage}等待队列已满（最多 {MAX_QUEUE_WAITERS} 个）"),
+    ))?;
+    tokio::time::timeout_at(deadline, slots.clone().acquire_owned()).await
+        .map_err(|_| QueueError(StatusCode::GATEWAY_TIMEOUT, format!("{stage}排队等待超时")))?
+        .map_err(|_| QueueError(StatusCode::SERVICE_UNAVAILABLE, "网关请求队列已关闭".into()))
+}
+
+struct PendingRequest<'a>(&'a Gateway);
+impl<'a> PendingRequest<'a> {
+    fn new(engine: &'a Gateway) -> Result<Self, String> {
+        let paused = engine.admission.lock().map_err(|_| "请求状态锁异常")?;
+        if *paused { return Err("网关正在断开恢复，请稍后再试".into()); }
+        engine.pending.fetch_add(1, Ordering::SeqCst);
+        drop(paused);
+        Ok(Self(engine))
+    }
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) { self.0.pending.fetch_sub(1, Ordering::SeqCst); }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRecord {
+    #[serde(default)]
+    pub info: crate::call_history::CallInfo,
     pub id: String,
     pub model_id: String,
     pub name: String,
@@ -71,8 +109,12 @@ pub struct Gateway {
     port: AtomicU16,
     active: AtomicUsize,
     slots: Arc<Semaphore>,
-    body_slots: Semaphore,
+    body_slots: Arc<Semaphore>,
+    body_queue: Semaphore,
+    upstream_queue: Semaphore,
+    pending: AtomicUsize,
     records: Mutex<VecDeque<CallRecord>>,
+    call_history: Mutex<crate::call_history::CallHistory>,
     history: Mutex<crate::history::History>,
     results: Mutex<BTreeMap<String, CallRecord>>,
     tests: Mutex<HashMap<String, Option<oneshot::Sender<()>>>>,
@@ -88,6 +130,7 @@ pub struct RuntimeView {
     pub test_results: BTreeMap<String, CallRecord>,
     pub history_version: u64,
     pub history_error: Option<String>,
+    pub call_error: Option<String>,
 }
 
 pub struct Pause<'a>(&'a Gateway);
@@ -97,7 +140,7 @@ impl Drop for Pause<'_> {
 impl Gateway {
     pub fn pause_if_idle(&self) -> Result<Pause<'_>, String> {
         let mut paused=self.admission.lock().map_err(|_| "请求状态锁异常")?;
-        if self.active.load(Ordering::SeqCst)>0 { return Err("仍有请求进行中，请结束后再断开".into()); }
+        if self.active.load(Ordering::SeqCst)>0 || self.pending.load(Ordering::SeqCst)>0 { return Err("仍有请求进行中或排队中，请结束后再断开".into()); }
         *paused=true;
         Ok(Pause(self))
     }
@@ -110,6 +153,11 @@ impl Gateway {
             .build()
             .map_err(|_| "初始化 HTTPS 客户端失败")?;
         let history = crate::history::History::open(store.lock().map_err(|_| "配置锁异常")?.usage_path());
+        let settings = store.lock().map_err(|_| "配置锁异常")?.config.settings.clone();
+        settings.validate()?;
+        let directory=store.lock().map_err(|_| "配置锁异常")?.usage_path().parent().unwrap().to_path_buf();
+        let call_history=crate::call_history::CallHistory::open(directory,&history.records(),settings.log_limit);
+        let restored=call_history.records.clone();
         Ok(Arc::new(Self {
             history: Mutex::new(history),
             admission: Mutex::new(false),
@@ -119,9 +167,13 @@ impl Gateway {
             control: tokio::sync::Mutex::new(None),
             port: AtomicU16::new(0),
             active: AtomicUsize::new(0),
-            slots: Arc::new(Semaphore::new(32)),
-            body_slots: Semaphore::new(2),
-            records: Mutex::new(VecDeque::new()),
+            slots: Arc::new(Semaphore::new(settings.upstream_concurrency)),
+            body_slots: Arc::new(Semaphore::new(settings.body_concurrency)),
+            body_queue: Semaphore::new(MAX_QUEUE_WAITERS),
+            upstream_queue: Semaphore::new(MAX_QUEUE_WAITERS),
+            pending: AtomicUsize::new(0),
+            records: Mutex::new(restored),
+            call_history: Mutex::new(call_history),
             results: Mutex::new(BTreeMap::new()),
             tests: Mutex::new(HashMap::new()),
         }))
@@ -171,11 +223,9 @@ impl Gateway {
         {
             return Err("模型列表地址指向网关自身".into());
         }
-        let _slot = self
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "请求繁忙")?;
+        let pending = PendingRequest::new(self)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(self.config()?.settings.timeout_seconds.into());
+        let _slot = queued_permit(&self.slots, &self.upstream_queue, deadline, "模型转发").await.map_err(|e| e.1)?;
         struct Active<'a>(&'a AtomicUsize);
         impl Drop for Active<'_> {
             fn drop(&mut self) {
@@ -188,6 +238,7 @@ impl Gateway {
             self.active.fetch_add(1, Ordering::SeqCst);
         }
         let _active = Active(&self.active);
+        drop(pending);
         let response = self
             .client
             .get(url)
@@ -238,8 +289,9 @@ impl Gateway {
             last_dsh_request: self.last_dsh_request.load(Ordering::SeqCst),
             history_version,
             history_error,
+            call_error: self.call_history.lock().map_err(|_| "调用历史锁异常")?.error.clone(),
             port: self.port.load(Ordering::SeqCst),
-            active_requests: self.active.load(Ordering::SeqCst),
+            active_requests: self.active.load(Ordering::SeqCst) + self.pending.load(Ordering::SeqCst),
             calls: self
                 .records
                 .lock()
@@ -289,8 +341,8 @@ impl Gateway {
     }
     pub async fn stop(&self) -> Result<(), String> {
         let mut control = self.control.lock().await;
-        if self.active.load(Ordering::SeqCst) > 0 {
-            return Err("仍有请求或测试进行中，请等待结束或取消测试后关闭网关".into());
+        if self.active.load(Ordering::SeqCst) > 0 || self.pending.load(Ordering::SeqCst) > 0 {
+            return Err("仍有请求或测试进行中或排队中，请等待结束或取消测试后关闭网关".into());
         }
         if let Some(running) = control.take() {
             let _ = running.stop.send(());
@@ -299,12 +351,59 @@ impl Gateway {
         self.port.store(0, Ordering::SeqCst);
         Ok(())
     }
-    pub fn clear_records(&self) -> Result<(), String> {
-        if self.active.load(Ordering::SeqCst) > 0 {
-            return Err("请求进行中，稍后再清空记录".into());
+    pub fn save_settings(&self, settings: crate::config::Settings) -> Result<(), String> {
+        settings.validate()?;
+        let paused = self.admission.lock().map_err(|_| "请求状态锁异常")?;
+        if *paused { return Err("网关正在断开恢复，请稍后再试".into()); }
+        let mut store = self.store.lock().map_err(|_| "配置锁异常")?;
+        let old = store.config.settings.clone();
+        let changed = old.body_concurrency != settings.body_concurrency
+            || old.upstream_concurrency != settings.upstream_concurrency;
+        if changed && (self.active.load(Ordering::SeqCst)>0 || self.pending.load(Ordering::SeqCst)>0) {
+            return Err("仍有请求进行中或排队中，请在网关空闲时修改并发数".into());
         }
-        self.records.lock().map_err(|_| "记录锁异常")?.clear();
+        store.settings(settings.clone())?;
+        if changed {
+            for (slots, count) in [(&self.body_slots, settings.body_concurrency), (&self.slots, settings.upstream_concurrency)] {
+                let available = slots.available_permits();
+                if count > available { slots.add_permits(count - available); }
+                else { slots.forget_permits(available - count); }
+            }
+        }
         Ok(())
+    }
+    pub fn statistics_storage(&self) -> Result<serde_json::Value, String> {
+        let h = self.history.lock().map_err(|_| "统计锁异常")?;
+        let (calls, bytes) = h.storage_info();
+        Ok(json!({"calls":calls,"bytes":bytes,"historyError":h.error}))
+    }
+    pub fn clear_statistics(&self) -> Result<(), String> {
+        let _pause = self.pause_if_idle()?;
+        let mut records = self.records.lock().map_err(|_| "记录锁异常")?;
+        let mut results = self.results.lock().map_err(|_| "测试结果锁异常")?;
+        self.history.lock().map_err(|_| "统计锁异常")?.clear()?;
+        self.call_history.lock().map_err(|_| "调用历史锁异常")?.clear(false)?;
+        records.clear(); results.clear();
+        Ok(())
+    }
+    pub fn clear_records(&self) -> Result<(), String> {
+        let _pause=self.pause_if_idle()?;
+        self.call_history.lock().map_err(|_| "调用历史锁异常")?.clear(false)?;
+        self.records.lock().map_err(|_| "记录锁异常")?.clear();
+        self.results.lock().map_err(|_| "结果锁异常")?.clear();
+        Ok(())
+    }
+    pub fn clear_call_details(&self) -> Result<(),String> {
+        let _pause=self.pause_if_idle()?;
+        self.call_history.lock().map_err(|_| "调用历史锁异常")?.clear(true)?;
+        for r in self.records.lock().map_err(|_| "记录锁异常")?.iter_mut() {r.preview.clear();}
+        for r in self.results.lock().map_err(|_| "结果锁异常")?.values_mut() {r.preview.clear();}
+        Ok(())
+    }
+    pub fn call_detail(&self, id:&str) -> Result<Value,String> {
+        let record=self.records.lock().map_err(|_| "记录锁异常")?.iter().find(|r|r.id==id).cloned().ok_or("记录已清理或超过保留上限")?;
+        let payload=self.call_history.lock().map_err(|_| "调用历史锁异常")?.payload(id)?;
+        Ok(json!({"record":record,"payload":payload}))
     }
     pub fn save_model(&self, input: ModelInput) -> Result<String, String> {
         let tests = self.tests.lock().map_err(|_| "测试锁异常")?;
@@ -341,7 +440,7 @@ impl Gateway {
     }
     pub async fn test(self: &Arc<Self>, id: &str) -> Result<CallRecord, String> {
         let (cancel, cancelled) = oneshot::channel();
-        let (model, timeout) = {
+        let (model, settings) = {
             let mut tests = self.tests.lock().map_err(|_| "测试锁异常")?;
             if tests.contains_key(id) {
                 return Err("这个模型正在测试".into());
@@ -354,10 +453,10 @@ impl Gateway {
                 .ok_or("模型已不存在")?
                 .clone();
             tests.insert(id.into(), Some(cancel));
-            (model, config.settings.timeout_seconds)
+            (model, config.settings)
         };
         let result = tokio::select! {
-            result=self.test_inner(&model,timeout)=>result,
+            result=self.test_inner(&model,&settings)=>result,
             _=cancelled=>Err("测试已取消".into()),
         };
         self.tests.lock().map_err(|_| "测试锁异常")?.remove(id);
@@ -366,9 +465,13 @@ impl Gateway {
     async fn test_inner(
         self: &Arc<Self>,
         model: &Model,
-        timeout: u32,
+        settings: &Settings,
     ) -> Result<CallRecord, String> {
-        let mut guard = RecordGuard::new(self.clone(), model, "test", true)?;
+        let pending = PendingRequest::new(self)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(settings.timeout_seconds.into());
+        let permit = queued_permit(&self.slots, &self.upstream_queue, deadline, "模型转发").await.map_err(|e| e.1)?;
+        let mut guard = RecordGuard::new(self.clone(), model, "test", true, permit)?;
+        drop(pending);
         let incoming = match test_headers(model) {
             Ok(headers) => headers,
             Err(error) => {
@@ -377,7 +480,7 @@ impl Gateway {
             }
         };
         let (response, zen_header) = match self
-            .send(model, protocol::test_body(model), incoming, timeout)
+            .send(model, protocol::test_body(model), incoming, settings, &mut guard)
             .await
         {
             Ok(r) => r,
@@ -398,9 +501,9 @@ impl Gateway {
         // Bounded, test-only buffer for terminal/error diagnostics. Proxy forwarding is unchanged.
         let mut response_body = Vec::new();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(bytes) => {
+        loop {
+            match next_response_chunk(&mut stream, Some(settings.stream_wait_seconds())).await {
+                Ok(Some(bytes)) => {
                     guard.feed(&bytes);
                     if guard.record.bytes > 2 * 1024 * 1024 {
                         guard.finish("error", if model.zen_test_enabled { guard.record.status } else { 200 }, "测试响应超过 2 MiB，已中止");
@@ -408,14 +511,9 @@ impl Gateway {
                     }
                     if model.zen_test_enabled { response_body.extend_from_slice(&bytes); }
                 }
-                Err(error) => {
-                    guard.finish("error", guard.record.status, if !model.zen_test_enabled {
-                        "读取上游响应失败或超时"
-                    } else if error.is_timeout() {
-                        "读取上游响应超时（尚未正常结束）"
-                    } else {
-                        "读取上游响应失败（连接中断或响应解码失败）"
-                    });
+                Ok(None) => break,
+                Err(message) => {
+                    guard.finish("error", guard.record.status, &message);
                     return Ok(guard.record.clone());
                 }
             }
@@ -446,7 +544,8 @@ impl Gateway {
         model: &Model,
         body: Value,
         incoming: HeaderMap,
-        timeout: u32,
+        settings: &Settings,
+        guard: &mut RecordGuard,
     ) -> Result<(reqwest::Response, bool), String> {
         let url = protocol::upstream_url(model)?;
         let parsed = url::Url::parse(&url).map_err(|_| "上游地址无效")?;
@@ -459,23 +558,47 @@ impl Gateway {
         let body = protocol::prepare_body(model, body)?;
         let headers = protocol::outgoing_headers(model, &incoming)?;
         let zen_header = headers.contains_key("x-opencode-session");
-        let response = self.client
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .timeout(Duration::from_secs(timeout.into()))
-            .send()
-            .await
-            .map_err(|e| -> String {
-                if e.is_timeout() {
-                    "连接上游超时".into()
-                } else if e.is_connect() {
-                    "连接上游失败，请检查地址、网络和证书".into()
-                } else {
-                    "上游请求失败".into()
-                }
-            })?;
+        guard.observe_request(&url, &body, &headers);
+        let streamed_request = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let request = self.client.post(url).headers(headers).json(&body);
+        let response = if streamed_request {
+            // Only waiting for response headers is bounded here. A reqwest total
+            // timeout would remain attached to the response body and cut active streams.
+            tokio::time::timeout(Duration::from_secs(settings.stream_wait_seconds()), request.send())
+                .await.map_err(|_| format!("本机等待响应头超时（连续等待 {} 秒）；未自动重试", settings.stream_wait_seconds()))?
+        } else {
+            request.timeout(Duration::from_secs(settings.timeout_seconds.into())).send().await
+        }.map_err(|e| -> String {
+            if e.is_timeout() { "连接上游超时".into() }
+            else if e.is_connect() { "连接上游失败，请检查地址、网络和证书".into() }
+            else { "上游请求失败".into() }
+        })?;
+        guard.record.info.ttfb_ms=Some(guard.elapsed());
         Ok((response, zen_header))
+    }
+}
+
+// Bounds each outstanding read, not the total lifetime. Nonempty bytes (including
+// SSE comments/heartbeats) count as link activity, never as model success. Waiting
+// for the downstream consumer is not upstream inactivity; no background buffering.
+async fn next_response_chunk<S>(upstream: &mut S, idle_seconds: Option<u64>) -> Result<Option<Bytes>, String>
+where S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin {
+    let next = async {
+        loop {
+            match upstream.next().await {
+                Some(Ok(bytes)) if bytes.is_empty() => continue,
+                Some(Ok(bytes)) => return Ok(Some(bytes)),
+                None => return Ok(None),
+                Some(Err(error)) => return Err(if error.is_timeout() {
+                    "读取上游响应超时（尚未正常结束）".to_owned()
+                } else { "读取上游响应失败（连接中断或响应解码失败）".to_owned() }),
+            }
+        }
+    };
+    match idle_seconds {
+        Some(seconds) => tokio::time::timeout(Duration::from_secs(seconds), next).await
+            .map_err(|_| format!("本机流式空闲超时（连续 {} 秒未收到数据）；未自动重试", seconds))?,
+        None => next.await,
     }
 }
 
@@ -565,10 +688,15 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
             "请发送未压缩的 application/json 请求",
         );
     }
-    // Bound simultaneous large-body buffering separately from long-lived SSE requests.
-    let body_permit = match engine.body_slots.try_acquire() {
+    let pending = match PendingRequest::new(&engine) {
+        Ok(pending) => pending,
+        Err(message) => return error(StatusCode::SERVICE_UNAVAILABLE, &message),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.settings.timeout_seconds.into());
+    // Keep this permit until upstream admission, bounding parsed bodies waiting in memory too.
+    let body_permit = match queued_permit(&engine.body_slots, &engine.body_queue, deadline, "请求体处理").await {
         Ok(permit) => permit,
-        Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "请求体接收繁忙，请稍后重试"),
+        Err(QueueError(status, message)) => return error(status, &message),
     };
     let bytes = match tokio::time::timeout(
         Duration::from_secs(15),
@@ -590,7 +718,6 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
         Err(_) => return error(StatusCode::BAD_REQUEST, "JSON 格式无效"),
     };
     drop(bytes);
-    drop(body_permit);
     let selected = match value.get("model").and_then(Value::as_str) {
         Some(m) => m,
         None => return error(StatusCode::BAD_REQUEST, "缺少模型 ID"),
@@ -615,21 +742,24 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
     {
         return error(StatusCode::BAD_REQUEST, &message);
     }
-    let mut guard = match RecordGuard::new(engine.clone(), model, "gateway", false) {
-        Ok(g) => g,
-        Err(_) => {
-            return error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "正在处理的请求过多，请稍后重试",
-            )
-        }
+    let permit = match queued_permit(&engine.slots, &engine.upstream_queue, deadline, "模型转发").await {
+        Ok(permit) => permit,
+        Err(QueueError(status, message)) => return error(status, &message),
     };
+    let mut guard = match RecordGuard::new(engine.clone(), model, "gateway", false, permit) {
+        Ok(g) => g,
+        Err(message) => return error(StatusCode::SERVICE_UNAVAILABLE, &message),
+    };
+    drop(body_permit);
+    drop(pending);
     if parts.headers.get("x-dsh-patrick").and_then(|h|h.to_str().ok())==Some("1") {
         engine.last_dsh_request.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,Ordering::SeqCst);
     }
     guard.record.zen_header_received = Some(parts.headers.contains_key("x-opencode-session"));
+    let stream_wait = value.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        .then_some(config.settings.stream_wait_seconds());
     let (response, zen_header) = match engine
-        .send(model, value, parts.headers, config.settings.timeout_seconds)
+        .send(model, value, parts.headers, &config.settings, &mut guard)
         .await
     {
         Ok(r) => r,
@@ -658,21 +788,22 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
     let upstream = response.bytes_stream();
     let stream = stream::unfold(
         (upstream, Some(guard)),
-        |(mut upstream, mut guard)| async move {
-            match upstream.next().await {
-                Some(Ok(bytes)) => {
+        move |(mut upstream, mut guard)| async move {
+            guard.as_ref()?; // An emitted read error is terminal; never reuse or retry that stream.
+            match next_response_chunk(&mut upstream, stream_wait).await {
+                Ok(Some(bytes)) => {
                     guard.as_mut().unwrap().feed(&bytes);
                     Some((Ok::<_, std::io::Error>(bytes), (upstream, guard)))
                 }
-                Some(Err(_)) => {
-                    let g = guard.as_mut().unwrap();
-                    g.finish("error", g.record.status, "上游流读取失败或超时");
+                Err(message) => {
+                    let mut g = guard.take().unwrap();
+                    g.finish("error", g.record.status, &message);
                     Some((
                         Err(std::io::Error::other("upstream stream interrupted")),
                         (upstream, guard),
                     ))
                 }
-                None => {
+                Ok(None) => {
                     let g = guard.as_mut().unwrap();
                     g.metrics.finish(g.elapsed());
                     let ok = !g.metrics.api_error && g.metrics.completed;
@@ -709,6 +840,9 @@ struct RecordGuard {
     metrics: Metrics,
     done: bool,
     secrets: Vec<String>,
+    payload: Option<crate::call_history::Payload>,
+    response_capture: Vec<u8>,
+    log_limit: usize,
     _permit: OwnedSemaphorePermit,
 }
 impl RecordGuard {
@@ -717,16 +851,13 @@ impl RecordGuard {
         model: &Model,
         source: &str,
         streamed: bool,
+        permit: OwnedSemaphorePermit,
     ) -> Result<Self, String> {
         let paused=engine.admission.lock().map_err(|_| "请求状态锁异常")?;
         if *paused { return Err("网关正在断开恢复".into()); }
-        let permit = engine
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "请求并发数达到上限")?;
         let config = engine.config()?;
         let record = CallRecord {
+            info:crate::call_history::CallInfo {model:Some(model.model.clone()),detailed:config.settings.detailed_logging,..Default::default()},
             id: new_id(),
             model_id: model.id.clone(),
             name: model.name.clone(),
@@ -762,6 +893,7 @@ impl RecordGuard {
                 records.pop_front();
             }
         }
+        if let Ok(mut history)=engine.call_history.lock() {history.record(&record,None,config.settings.log_limit);}
         engine.active.fetch_add(1, Ordering::SeqCst);
         drop(paused);
         let mut secrets: Vec<String> = model
@@ -781,14 +913,32 @@ impl RecordGuard {
             metrics: Metrics::new(streamed),
             done: false,
             secrets,
+            payload: None,
+            response_capture: Vec::new(),
+            log_limit: config.settings.log_limit,
             _permit: permit,
         })
+    }
+    fn observe_request(&mut self, url:&str, body:&Value, headers:&HeaderMap) {
+        self.secrets.extend(headers.iter().filter(|(name,_)| !matches!(name.as_str(),"content-type"|"accept"|"user-agent"|"anthropic-version"|"anthropic-beta")).filter_map(|(_,value)| value.to_str().ok()).filter(|v|!v.is_empty()).map(str::to_owned));
+        self.record.info.request_url=Some(crate::call_history::redact_text(url,&self.secrets));
+        self.record.info.model=body.get("model").and_then(Value::as_str).map(|s|crate::call_history::redact_text(s,&self.secrets));
+        self.record.info.reasoning=body.get("reasoning_effort").or_else(||body.pointer("/reasoning/effort")).or_else(||body.pointer("/output_config/effort")).and_then(Value::as_str).map(|s|crate::call_history::redact_text(s,&self.secrets).chars().take(100).collect());
+        self.record.info.message_count=body.get("messages").or_else(||body.get("input")).and_then(Value::as_array).map(Vec::len);
+        self.record.info.tool_count=Some(body.get("tools").and_then(Value::as_array).map_or(0,Vec::len));
+        if self.record.info.detailed {self.payload=Some(crate::call_history::capture_request(headers,body,&self.secrets));}
     }
     fn elapsed(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
     fn feed(&mut self, bytes: &[u8]) {
         self.record.bytes += bytes.len() as u64;
+        if let Some(payload)=&mut self.payload {
+            payload.response_chunks+=1;
+            let available=crate::call_history::PAYLOAD_LIMIT.saturating_sub(self.response_capture.len());
+            self.response_capture.extend_from_slice(&bytes[..bytes.len().min(available)]);
+            payload.response_truncated |= bytes.len()>available;
+        }
         self.metrics.feed(bytes, self.elapsed());
     }
     fn finish(&mut self, state: &str, status: u16, message: &str) {
@@ -798,7 +948,21 @@ impl RecordGuard {
         self.done = true;
         self.record.state = state.into();
         self.record.status = status;
-        self.record.message = message.into();
+        self.record.message = crate::call_history::redact_text(message,&self.secrets);
+        self.record.info.finish_reason=self.metrics.finish_reason.clone();
+        self.record.info.ttfr_ms=self.metrics.first_valid_ms;
+        self.record.info.reasoning_tokens=self.metrics.reasoning_tokens;
+        self.record.info.error_kind=match state {
+            "success"=>None,
+            "cancelled"=>Some("cancelled".into()),
+            _=>Some(if message.starts_with("本机流式空闲超时") {"stream_idle_timeout"}
+                else if message.starts_with("本机等待响应头超时") {"response_headers_timeout"}
+                else if message.starts_with("读取上游响应失败") {"transport"}
+                else if message.contains("超时") {"timeout"} else if status>=400 {"http"} else if self.metrics.api_error {"stream"} else {"provider"}.into()),
+        };
+        if let Some(payload)=&mut self.payload {
+            payload.response=crate::call_history::capture_response(&self.response_capture,&self.secrets);
+        }
         self.record.duration_ms = self.elapsed();
         self.record.first_token_ms = self.metrics.first_token_ms;
         self.record.input_tokens = self.metrics.input_tokens;
@@ -820,6 +984,7 @@ impl RecordGuard {
                 *record = self.record.clone();
             }
         }
+        if let Ok(mut history) = self.engine.call_history.lock() { history.record(&self.record,self.payload.as_ref(),self.log_limit); }
         if let Ok(mut history) = self.engine.history.lock() { history.record(&self.record); }
         if self.record.source == "test" {
             if let Ok(mut results) = self.engine.results.lock() {

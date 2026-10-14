@@ -43,6 +43,15 @@ impl History {
         if records.len() > 10000 { records.drain(..records.len() - 10000); }
     }
     pub fn records(&self) -> Vec<UsageRecord> { self.records.clone() }
+    pub fn storage_info(&self) -> (usize, u64) {
+        (self.records.len(), std::fs::metadata(&self.path).map(|m|m.len()).unwrap_or(0))
+    }
+    pub fn clear(&mut self) -> Result<(), String> {
+        // User-confirmed clear affects this one encrypted metadata file only.
+        vault::write(&self.path, b"[]")?;
+        self.records.clear(); self.version += 1; self.error = None; self.readable = true;
+        Ok(())
+    }
     pub fn record(&mut self, call: &CallRecord) {
         self.records.push(UsageRecord {
             id: call.id.clone(), started_at: call.started_at, source: call.source.clone(), state: call.state.clone(),

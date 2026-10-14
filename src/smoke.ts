@@ -229,12 +229,16 @@ export async function runSmoke() {
       theme: "dark",
       timeoutSeconds: 60,
       maxBodyMb: 32,
+      bodyConcurrency: 8,
+      upstreamConcurrency: 20,
     });
     state = await api.snapshot();
     assert(
       state.settings.theme === "dark" &&
         state.settings.timeoutSeconds === 60 &&
-        state.settings.maxBodyMb === 32,
+        state.settings.maxBodyMb === 32 &&
+        state.settings.bodyConcurrency === 8 &&
+        state.settings.upstreamConcurrency === 20,
       "settings_persisted",
     );
     await api.remove(copied);
@@ -246,6 +250,8 @@ export async function runSmoke() {
       theme: "light",
       timeoutSeconds: 120,
       maxBodyMb: 64,
+      bodyConcurrency: 16,
+      upstreamConcurrency: 32,
     });
     const upstream = state.testUpstream;
     assert(
@@ -485,12 +491,12 @@ export async function runSmoke() {
     );
     // Exercise the real test button + IPC + HTTP stream + visible terminal state.
     const diagnosticSettings = (await api.snapshot()).settings;
-    await api.settings({ ...diagnosticSettings, timeoutSeconds: 5 });
+    await api.settings({ ...diagnosticSettings, timeoutSeconds: 5, streamIdleSeconds: 5, streamGraceSeconds: 1 });
     for (const [model, expected, reason] of [
       ["native-diag-error", "error", "Access forbidden [已脱敏]"],
       ["native-diag-empty", "error", "空响应"],
       ["native-diag-truncated", "error", "缺少模型结束事件"],
-      ["native-diag-timeout", "error", "读取上游响应超时"],
+      ["native-diag-timeout", "error", "本机流式空闲超时"],
       ["native-mock", "success", "模型连接测试通过"],
     ]) {
       const id = await api.save({ ...emptyModel(), name: "Zen result diagnostic", model,
@@ -508,9 +514,9 @@ export async function runSmoke() {
       assert(true, `${model}_button_loading_ends`);
       const button = await wait(`[data-test-model="${id}"]`);
       button.closest(".model-card")!.querySelector<HTMLButtonElement>(`button.test-status.${expected}`)!.click();
-      const banner = await wait(`.result-banner.${expected}`);
+      const banner = await wait(`.call-details[data-state="${expected}"]`);
       assert(banner.textContent?.includes(reason), `${model}_visible_terminal_reason`);
-      assert(!document.querySelector(".detail-body")?.textContent?.includes("NATIVE_MOCK_KEY"), `${model}_details_redacted`);
+      assert(!document.querySelector(".call-details")?.textContent?.includes("NATIVE_MOCK_KEY"), `${model}_details_redacted`);
       (await wait('[aria-label="关闭弹窗"]')).click();
       await api.remove(id);
     }
@@ -528,6 +534,18 @@ export async function runSmoke() {
         "64",
       "request_limit_setting_rendered",
     );
+    for (const [name, maximum] of [["bodyConcurrency", 16], ["upstreamConcurrency", 32]] as const) {
+      const input = (await wait(`input[name="${name}"]`)) as HTMLInputElement;
+      assert(input.value === String(maximum) && input.min === "1" && input.max === String(maximum), `${name}_range_rendered`);
+      input.value = String(maximum + 1);
+      assert(!input.checkValidity(), `${name}_above_max_rejected`);
+      input.value = "0";
+      assert(!input.checkValidity(), `${name}_zero_rejected`);
+      input.value = "1.5";
+      assert(!input.checkValidity(), `${name}_fraction_rejected`);
+      input.value = String(maximum);
+      assert(input.checkValidity(), `${name}_valid_range_accepted`);
+    }
     assert(
       document.body.textContent?.includes("Windows 当前用户 DPAPI 加密"),
       "settings_page_rendered",
@@ -550,6 +568,12 @@ export async function runSmoke() {
     checks.push(...(await runUIRegression()));
     const { runDesktopRegression } = await import("./desktopRegression");
     checks.push(...(await runDesktopRegression()));
+    const { runCallsRegression } = await import("./callsRegression");
+    checks.push(...(await runCallsRegression()));
+    const { runSettingsRegression } = await import("./settingsRegression");
+    checks.push(...(await runSettingsRegression()));
+    const { runOverviewRegression } = await import("./overviewRegression");
+    checks.push(...(await runOverviewRegression()));
     await invoke("smoke_finish", { checks });
     (await wait('[aria-label="关闭窗口"]')).click();
   } catch (error) {

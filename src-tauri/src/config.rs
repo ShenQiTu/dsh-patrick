@@ -108,6 +108,24 @@ impl Model {
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TokenPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+}
+impl TokenPricing {
+    pub fn validate(&self) -> Result<(), String> {
+        if [self.input,self.output,self.cache_read,self.cache_write].into_iter().flatten()
+            .any(|v| !v.is_finite() || !(0.0..=1_000_000.0).contains(&v)) {
+            return Err("Token 单价需为 0–1000000 的有限数值，或留空".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
@@ -115,11 +133,25 @@ pub struct Settings {
     pub dsh_profile: String,
     pub port: u16,
     pub timeout_seconds: u32,
+    #[serde(default = "default_stream_idle_seconds")]
+    pub stream_idle_seconds: u32,
+    #[serde(default = "default_stream_grace_seconds")]
+    pub stream_grace_seconds: u32,
     #[serde(default = "default_max_body_mb")]
     pub max_body_mb: usize,
+    #[serde(default = "default_body_concurrency")]
+    pub body_concurrency: usize,
+    #[serde(default = "default_upstream_concurrency")]
+    pub upstream_concurrency: usize,
     pub theme: String,
     pub log_limit: usize,
+    #[serde(default)]
+    pub detailed_logging: bool,
 }
+fn default_stream_idle_seconds() -> u32 { 600 }
+fn default_stream_grace_seconds() -> u32 { 10 }
+fn default_body_concurrency() -> usize { 16 }
+fn default_upstream_concurrency() -> usize { 32 }
 fn default_max_body_mb() -> usize {
     64
 }
@@ -129,22 +161,34 @@ impl Default for Settings {
             port: 8787,
             dsh_profile: crate::dsh::default_profile(),
             timeout_seconds: 120,
+            stream_idle_seconds: default_stream_idle_seconds(),
+            stream_grace_seconds: default_stream_grace_seconds(),
             max_body_mb: default_max_body_mb(),
+            body_concurrency: default_body_concurrency(),
+            upstream_concurrency: default_upstream_concurrency(),
             theme: "light".into(),
             log_limit: 200,
+            detailed_logging: false,
         }
     }
 }
 impl Settings {
+    pub fn stream_wait_seconds(&self) -> u64 {
+        u64::from(self.stream_idle_seconds) + u64::from(self.stream_grace_seconds)
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.dsh_profile.len() > 2048 || self.dsh_profile.chars().any(char::is_control) || self.port < 1024
-            || !(5..=600).contains(&self.timeout_seconds)
+            || !(5..=700).contains(&self.timeout_seconds)
+            || !(5..=7200).contains(&self.stream_idle_seconds)
+            || !(1..=60).contains(&self.stream_grace_seconds)
             || !(1..=128).contains(&self.max_body_mb)
+            || !(1..=16).contains(&self.body_concurrency)
+            || !(1..=32).contains(&self.upstream_concurrency)
             || !(10..=1000).contains(&self.log_limit)
             || !["light", "dark", "system"].contains(&self.theme.as_str())
         {
             return Err(
-                "设置值超出范围：端口 1024–65535，超时 5–600 秒，请求体 1–128 MiB，记录 10–1000 条"
+                "设置值超出范围：端口 1024–65535，排队/非流式超时 5–700 秒，流式无数据基准 5–7200 秒，宽限 1–60 秒，请求体 1–128 MiB，接收并发 1–16，转发并发 1–32，记录 10–1000 条"
                     .into(),
             );
         }
@@ -154,6 +198,8 @@ impl Settings {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub pricing: TokenPricing,
     pub version: u32,
     pub models: Vec<Model>,
     pub settings: Settings,
@@ -164,6 +210,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
+            pricing: TokenPricing::default(),
             models: vec![],
             settings: Settings::default(),
             gateway_token: String::new(),
@@ -306,6 +353,7 @@ impl Store {
             return Err("配置版本或模型数量不受支持".into());
         }
         config.settings.validate()?;
+        config.pricing.validate()?;
         let mut names = HashSet::new();
         let mut ids = HashSet::new();
         for m in &config.models {
@@ -462,6 +510,12 @@ impl Store {
             thinking_budget: m.thinking_budget,
         })
     }
+    pub fn pricing(&mut self, pricing: TokenPricing) -> Result<(), String> {
+        pricing.validate()?;
+        let mut next = self.config.clone();
+        next.pricing = pricing;
+        self.commit(next)
+    }
     pub fn settings(&mut self, settings: Settings) -> Result<(), String> {
         settings.validate()?;
         let mut next = self.config.clone();
@@ -473,6 +527,44 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pricing_legacy_validation_and_encrypted_persistence() {
+        let path = std::env::temp_dir().join(new_id());
+        let mut store = Store::open(path.clone()).unwrap();
+        let mut value = serde_json::to_value(sample()).unwrap(); value["id"] = serde_json::Value::Null;
+        store.save(serde_json::from_value(value).unwrap()).unwrap();
+        let models = serde_json::to_value(&store.config.models).unwrap();
+        let token = store.config.gateway_token.clone();
+        let mut legacy = serde_json::to_value(&store.config).unwrap();
+        legacy.as_object_mut().unwrap().remove("pricing");
+        drop(store);
+        crate::vault::write(&path.join("config.dpapi"), &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut store = Store::open(path.clone()).unwrap();
+        assert!(store.config.pricing.input.is_none());
+        let price = TokenPricing { input:Some(0.0), output:Some(2.5), cache_read:None, cache_write:Some(1000000.0) };
+        store.pricing(price.clone()).unwrap();
+        let disk = std::fs::read(path.join("config.dpapi")).unwrap();
+        for bad in [-1.0, 1000000.1, f64::INFINITY, f64::NAN] {
+            assert!(store.pricing(TokenPricing { input:Some(bad), ..price.clone() }).is_err());
+            assert_eq!(std::fs::read(path.join("config.dpapi")).unwrap(),disk);
+        }
+        store.settings(store.config.settings.clone()).unwrap();
+        drop(store);
+        let store = Store::open(path.clone()).unwrap();
+        assert_eq!(store.config.pricing.input,Some(0.0)); assert_eq!(store.config.pricing.output,Some(2.5));
+        assert_eq!(store.config.pricing.cache_read,None); assert_eq!(store.config.pricing.cache_write,Some(1000000.0));
+        assert_eq!(serde_json::to_value(&store.config.models).unwrap(),models);
+        assert_eq!(store.config.gateway_token,token);
+        let mut invalid=serde_json::to_value(&store.config).unwrap(); invalid["pricing"]["input"]=serde_json::json!(-1);
+        drop(store);
+        crate::vault::write(&path.join("config.dpapi"), &serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let original=std::fs::read(path.join("config.dpapi")).unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(std::fs::read(path.join("config.dpapi")).unwrap(),original);
+        std::fs::remove_file(path.join("config.dpapi")).unwrap();
+        std::fs::remove_file(path.join("instance.lock")).unwrap(); std::fs::remove_dir(path).unwrap();
+        println!("PRICING_PASS legacy=EMPTY zero=VALID range=VALIDATED persistence=PASS models_keys_token=UNCHANGED invalid_disk=PRESERVED");
+    }
     fn sample() -> Model {
         Model {
             id: "test".into(),
@@ -586,6 +678,49 @@ mod tests {
         m.thinking_budget = Some(1024);
         assert!(validate_model(&m).is_ok());
     }
+    #[test]
+    fn timeout_700_boundary_and_persistence() {
+        assert_eq!(Settings::default().timeout_seconds,120);
+        for timeout in [5,120,600,700,601] {
+            let settings=Settings{timeout_seconds:timeout,..Settings::default()};
+            assert!(settings.validate().is_ok(),"TIMEOUT_700_REJECTED: {timeout}");
+        }
+        for timeout in [0,4,701,u32::MAX] {
+            assert!(Settings{timeout_seconds:timeout,..Settings::default()}.validate().is_err());
+        }
+        let directory=std::env::temp_dir().join(new_id());
+        let mut store=Store::open(directory.clone()).unwrap();
+        let mut settings=store.config.settings.clone();settings.timeout_seconds=700;
+        store.settings(settings.clone()).unwrap();
+        settings.timeout_seconds=701;assert!(store.settings(settings).is_err());
+        assert_eq!(store.config.settings.timeout_seconds,700);drop(store);
+        let reopened=Store::open(directory.clone()).unwrap();
+        assert_eq!(reopened.config.settings.timeout_seconds,700);drop(reopened);
+        for name in ["config.dpapi","instance.lock"] {std::fs::remove_file(directory.join(name)).unwrap();}
+        std::fs::remove_dir(directory).unwrap();
+        println!("TIMEOUT_700_PASS min=5 max=700 rejected=4/701 default=120 persisted_reopen=700 invalid_save=PRESERVED");
+    }
+    #[test]
+    fn stream_timeout_legacy_defaults_boundaries_and_persistence() {
+        let mut json=serde_json::to_value(Settings::default()).unwrap();
+        json.as_object_mut().unwrap().remove("streamIdleSeconds");
+        json.as_object_mut().unwrap().remove("streamGraceSeconds");
+        json["timeoutSeconds"]=serde_json::json!(610);
+        let legacy:Settings=serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.timeout_seconds,610);assert_eq!(legacy.stream_wait_seconds(),610);
+        for (base,grace,valid) in [(5,1,true),(600,10,true),(7200,60,true),(4,10,false),(7201,10,false),(600,0,false),(600,61,false),(u32::MAX,10,false)] {
+            assert_eq!(Settings{stream_idle_seconds:base,stream_grace_seconds:grace,..legacy.clone()}.validate().is_ok(),valid);
+        }
+        let directory=std::env::temp_dir().join(new_id());
+        let mut store=Store::open(directory.clone()).unwrap();
+        let mut settings=legacy;settings.stream_idle_seconds=180;settings.stream_grace_seconds=10;
+        store.settings(settings.clone()).unwrap();settings.stream_grace_seconds=0;assert!(store.settings(settings).is_err());drop(store);
+        let reopened=Store::open(directory.clone()).unwrap();
+        assert_eq!(reopened.config.settings.stream_wait_seconds(),190);assert_eq!(reopened.config.settings.timeout_seconds,610);drop(reopened);
+        for name in ["config.dpapi","instance.lock"] {std::fs::remove_file(directory.join(name)).unwrap();}std::fs::remove_dir(directory).unwrap();
+        println!("STREAM_SETTINGS_PASS legacy=600+10 old_value=PRESERVED boundaries=PASS dpapi_reopen=190 invalid_save=PRESERVED");
+    }
+
     #[test]
     fn invalid_settings() {
         let s = Settings {

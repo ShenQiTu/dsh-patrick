@@ -1,0 +1,45 @@
+/* Scoped to settings and DSH connection; reference card spacing is 16px. */
+.settings-page { display: grid; gap: 16px; min-width: 0; padding-bottom: 16px; }
+.settings-page > form, .settings-page .panel { margin: 0; min-width: 0; }
+.settings-extra .panel-title { min-height: 36px; padding: 0 10px; gap: 12px; }
+.settings-extra .panel-title h3 { font-size: 14px; }
+.settings-extra .text-button { background: transparent; border-color: transparent; color: var(--blue); padding: 4px 6px; }
+.settings-description { padding: 16px 16px 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.settings-row { padding: 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; min-width: 0; }
+.settings-row > div { min-width: 0; }
+.settings-row b { font-weight: 600; }
+.settings-row small { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 4px; overflow-wrap: anywhere; }
+.settings-row > button { flex-shrink: 0; }
+.price-row label { font-weight: 600; }
+.price-row > .muted { padding: 0; line-height: 1.5; }
+.price-row input { width: 150px; max-width: 40%; text-align: right; }
+.settings-actions { display: flex; align-items: center; gap: 8px; padding: 0 16px 16px; }
+.settings-actions > span { flex: 1; }
+.settings-message { padding: 0 16px 16px; color: var(--muted); overflow-wrap: anywhere; line-height: 1.6; }
+.settings-message[role="alert"] { color: var(--red); }
+.settings-update-result { display: flex; align-items: center; gap: 16px; padding: 0 16px 16px; }
+.settings-update-result p { flex: 1; min-width: 0; color: var(--muted); line-height: 1.6; overflow-wrap: anywhere; }
+.settings-update-result button { flex-shrink: 0; }
+.connection-panel { flex-shrink: 0; min-width: 0; }
+.connection-content { padding: 16px; display: grid; gap: 16px; min-width: 0; }
+.connection-content > p { margin: 0; color: var(--muted); line-height: 1.6; }
+.connection-profile { width: min(100%, 520px); min-width: 0; }
+.connection-content .field { margin: 0; }
+.connection-content .connection-buttons { margin: 12px 0 0; }
+.connection-content .address-row { margin: 0; padding: 12px; gap: 16px; min-width: 0; }
+.connection-content .address-row > span { flex-shrink: 0; }
+.connection-content .address-row code { min-width: 0; overflow-wrap: anywhere; white-space: normal; text-align: right; }
+.connection-content .connection-options { padding: 0; min-width: 0; }
+.connection-content .connection-options > div { padding: 12px 0; }
+.connection-content .connection-options > div:last-child { padding-bottom: 0; }
+.connection-content .connection-options span { min-width: 0; overflow-wrap: anywhere; }
+.connection-recovery { display: grid; gap: 16px; min-width: 0; }
+.connection-recovery > p { margin: 0; padding: 0; line-height: 1.6; }
+
+.settings-groups { display:grid; gap:16px; min-width:0; }
+.settings-groups .form-grid { padding:16px; }
+.settings-log-toggle { display:flex; align-items:center; gap:16px; min-width:0; }
+.settings-log-toggle > div {flex:1;min-width:0;}
+.settings-log-toggle small {display:block;color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px;}
+.settings-groups .settings-message {margin:0;padding:0 16px 16px;}
+.settings-groups > .settings-foot {padding:12px 16px;}

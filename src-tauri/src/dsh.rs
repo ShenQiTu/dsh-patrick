@@ -19,6 +19,24 @@ pub fn default_profile() -> String {
         .map(|home| home.join("profiles").join("web").display().to_string()).unwrap_or_default()
 }
 
+// A profile may be attached by another portable copy. Exiting this copy must
+// not restore that copy's routes. The bridge rechecks ownership under its locks
+// before an owned restore, so a journal change here never bypasses that guard.
+pub fn owns_integration(directory: &Path, profile: &str) -> Result<bool, String> {
+    if profile.trim().is_empty() { return Ok(false); }
+    let path=Path::new(profile).join(".dsh-patrick/journal.json");
+    let bytes=match std::fs::read(path) {
+        Ok(bytes)=>bytes,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(false),
+        Err(_)=>return Err("读取 DSH 接入归属失败；接入记录保持不变，请核对后重试".into()),
+    };
+    let journal:serde_json::Value=serde_json::from_slice(&bytes)
+        .map_err(|_| "DSH 接入记录格式错误；原文件保持不变，请核对后重试")?;
+    let owner=journal.get("owner").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty())
+        .ok_or("DSH 接入记录缺少归属；原文件保持不变，请核对后重试")?;
+    Ok(owner==directory.to_string_lossy())
+}
+
 // Commands use stdin, not argv, for the random loopback token. No upstream
 // credentials, prompts or arbitrary headers are sent to this helper.
 pub fn execute(directory: &Path, config: &Config, action: &str, port: u16) -> Result<Status, String> {

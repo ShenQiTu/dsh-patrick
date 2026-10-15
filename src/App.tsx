@@ -4,6 +4,7 @@ import { ModelEditor } from "./ModelEditor";
 import { Empty, Field, Icon, Modal, Switch } from "./ui";
 import {
   protocols,
+  dshConnectionLabel,
   type CallRecord,
   type Model,
   type Page,
@@ -66,6 +67,8 @@ export function App() {
     [detail, setDetail] = useState<CallRecord | null>(null),
     [confirmClear, setConfirmClear] = useState(false),
     [batch, setBatch] = useState(false);
+  const [closeBusy,setCloseBusy]=useState(false),[closeError,setCloseError]=useState("");
+  useEffect(()=>setCloseError(""),[state?.closeRequest?.id]);
   const cancelled = useRef(false),
     activeTests = useRef(new Set<string>());
   useEffect(() => {
@@ -137,6 +140,16 @@ export function App() {
       setBusy(false);
     }
   }
+  async function resolveClose(confirm:boolean) {
+    const request=state?.closeRequest;if(!request||closeBusy)return;
+    setCloseBusy(true);setCloseError("");
+    try {
+      await api.resolveClose(request.id,confirm);
+      await refresh();
+      if(confirm&&!request.exit)setNotice("网关已停止；配置已保留，接入恢复待处理");
+    } catch(e) {setCloseError(String(e instanceof Error?e.message:e));}
+    finally {setCloseBusy(false);}
+  }
   async function testModels(ids: string[]) {
     setTestTargets(null);
     setBatch(ids.length > 1);
@@ -182,6 +195,7 @@ export function App() {
     cancelled.current = true;
     await Promise.all([...activeTests.current].map((id) => api.cancel(id)));
   }
+  const connectionLabel=dshConnectionLabel(state);
   const current = pages[page];
   const models = state?.models ?? [];
   const calls = state?.runtime.calls ?? [];
@@ -227,12 +241,12 @@ export function App() {
             <span>DSH</span>
             <span
               className={
-                "menu-status " + (state?.dshConnected ? "connected" : "")
+                "menu-status " + (connectionLabel === "已同步" ? "connected" : ["核验失败","待恢复"].includes(connectionLabel) ? "failed" : "")
               }
               data-dsh-status
-              title="客户端接入状态与网关监听状态分开显示"
+              title={state?.dshRecoveryPending ? "上次停止保留了 DSH 配置；恢复待处理，网关运行状态单独显示" : state?.dsh.message || "接入配置尚未核对；网关监听状态单独显示"}
             >
-              {state?.dshConnected ? "已同步" : "未接管"}
+              {connectionLabel}
             </span>
           </button>
           <p className="nav-label">设置</p>
@@ -587,10 +601,26 @@ export function App() {
             {native ? "Rust · Tauri 桌面端" : "浏览器界面预览"}
           </span>
           <span>
-            {state?.runtime.activeRequests ?? 0} 个请求进行中 <i /> {state?.dshConnected ? "DSH 配置已同步" : "DSH 未接管"}
+            {state?.runtime.activeRequests ?? 0} 个请求进行中 <i /> DSH {connectionLabel}
           </span>
         </footer>
       </div>
+      {state?.closeRequest && <Modal
+        title={state.closeRequest.exit?"退出前恢复配置失败":"停止网关前恢复配置失败"}
+        subtitle="当前网关尚未因此停止；取消会保持现状。"
+        onClose={()=>{if(!closeBusy)void resolveClose(false);}}
+      >
+        <div className="confirm-body" data-close-recovery>
+          <p>{state.closeRequest.message}</p>
+          <p>可以保留当前 DSH 配置、凭据和恢复记录，仅停止本机网关{state.closeRequest.exit?"并退出软件":""}。Patrick 模型入口会继续保留，但网关停止后暂时不可用；下次启动会提示接入恢复待处理。</p>
+          <p>此操作不覆盖冲突内容，也不强制中断正在执行或排队的请求。</p>
+          {closeError&&<p className="form-error" role="alert">{closeError}</p>}
+        </div>
+        <footer className="modal-foot"><span/><div>
+          <button data-close-cancel disabled={closeBusy} onClick={()=>void resolveClose(false)}>取消</button>
+          <button className="primary" data-close-preserve disabled={closeBusy} onClick={()=>void resolveClose(true)}>{closeBusy?"处理中…":state.closeRequest.exit?"保留配置并退出":"保留配置，仅停止网关"}</button>
+        </div></footer>
+      </Modal>}
       {notice && (
         <div className="toast" role="status">
           <Icon name="check" size={17} />

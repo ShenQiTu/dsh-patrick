@@ -167,6 +167,49 @@ pub fn valid_zen_session(value: &str) -> bool {
         && value.as_bytes()[16..].iter().all(u8::is_ascii_alphanumeric)
 }
 
+pub const ZEN_SESSION_HEADERS: [&str; 2] = ["x-opencode-session", "x-opencode-session-id"];
+
+pub fn has_zen_header(headers: &HeaderMap) -> bool {
+    ZEN_SESSION_HEADERS.iter().any(|name| headers.contains_key(*name))
+}
+
+pub struct ZenSession {
+    pub value: Option<HeaderValue>,
+    pub state: &'static str,
+}
+
+// Preserve the verified CLI format. Empty primary falls back to the alias, like the relay.
+// Reject malformed or ambiguous repeated values without echoing any header contents.
+pub fn zen_session(headers: &HeaderMap) -> Result<ZenSession, String> {
+    let mut values = Vec::new();
+    for name in ZEN_SESSION_HEADERS {
+        let mut selected: Option<HeaderValue> = None;
+        for value in headers.get_all(name) {
+            let text = value.to_str().map_err(|_| "Zen 会话头格式无效")?;
+            if text.trim().is_empty() { continue; }
+            if !valid_zen_session(text) { return Err("Zen 会话头格式无效".into()); }
+            if selected.as_ref().is_some_and(|prior| prior != value) {
+                return Err("Zen 同名会话头存在重复值冲突".into());
+            }
+            selected = Some(value.clone());
+        }
+        values.push(selected);
+    }
+    let state = match (&values[0], &values[1]) {
+        (Some(a), Some(b)) if a != b => "conflict_primary",
+        (Some(_), Some(_)) => "both",
+        (Some(_), None) => "primary",
+        (None, Some(_)) => "alias",
+        _ => "absent",
+    };
+    Ok(ZenSession { value: values[0].take().or(values[1].take()), state })
+}
+
+fn set_zen_session(headers: &mut HeaderMap, mut value: HeaderValue) {
+    value.set_sensitive(true);
+    for name in ZEN_SESSION_HEADERS { headers.insert(name, value.clone()); }
+}
+
 pub fn outgoing_headers(model: &Model, incoming: &HeaderMap) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -201,13 +244,15 @@ pub fn outgoing_headers(model: &Model, incoming: &HeaderMap) -> Result<HeaderMap
             value,
         );
     }
-    // This is the only inherited client header: per-request Zen value takes precedence.
-    if let Some(value) = incoming.get("x-opencode-session") {
-        let text = value.to_str().map_err(|_| "Zen 会话头格式无效")?;
-        if !valid_zen_session(text) {
-            return Err("Zen 会话头格式无效".into());
-        }
-        headers.insert("x-opencode-session", value.clone());
+    // Only the two session aliases are inherited, never client auth or arbitrary headers.
+    // Normalize after static headers so neither stale alias can override a dynamic session.
+    let dynamic = zen_session(incoming)?;
+    if let Some(value) = dynamic.value {
+        set_zen_session(&mut headers, value);
+    } else if has_zen_header(&headers) {
+        let configured = zen_session(&headers)?;
+        if let Some(value) = configured.value { set_zen_session(&mut headers, value); }
+        else { for name in ZEN_SESSION_HEADERS { headers.remove(name); } }
     }
     Ok(headers)
 }
@@ -226,6 +271,9 @@ pub struct Metrics {
     pub saw_text: bool,
     pub api_error: bool,
     pub completed: bool,
+    zen_stream_error: Option<&'static str>,
+    zen_nontext_output: bool,
+    event_name: String,
     pending: Vec<u8>,
     event_data: String,
     json_body: Vec<u8>,
@@ -238,8 +286,29 @@ impl Metrics {
             ..Self::default()
         }
     }
+    pub fn zen_failure(&self) -> Option<&'static str> {
+        if let Some(error) = self.zen_stream_error { Some(error) }
+        else if !self.completed { Some("Zen 上游流提前结束（缺少模型结束事件）") }
+        else if !self.saw_text && !self.zen_nontext_output { Some("Zen 上游未返回模型输出（空响应或仅心跳）") }
+        else { None }
+    }
+    pub fn zen_success(&self) -> bool { self.zen_failure().is_none() }
     fn event(&mut self, value: &Value, elapsed: u64) {
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let root = value.get("response").or_else(|| value.get("message")).unwrap_or(value);
+        let status = root.get("status").and_then(Value::as_str).unwrap_or("");
+        // Zen diagnostics inspect the result, not mere presence of an optional error:null.
+        // Keep the pre-existing non-Zen metrics/result policy unchanged.
+        if [value, root].iter().any(|v| v.get("error").is_some_and(|e| !e.is_null()))
+            || matches!(kind, "error" | "response.failed" | "response.incomplete")
+            || matches!(status, "failed" | "incomplete" | "cancelled")
+            || ((!self.sse || kind == "response.completed") && matches!(status, "in_progress" | "queued"))
+        { self.zen_stream_error = Some("Zen 上游返回流内或结构化错误"); }
+        let zen_reason = value.pointer("/choices/0/finish_reason")
+            .or_else(|| value.pointer("/delta/stop_reason")).or_else(|| root.get("stop_reason"));
+        if zen_reason.and_then(Value::as_str).is_some_and(|r| matches!(r,"length"|"max_tokens"|"content_filter"|"error")) {
+            self.zen_stream_error = Some("Zen 模型输出未正常结束（达到长度上限或中止）");
+        }
         if value.get("error").is_some()
             || matches!(kind, "error" | "response.failed" | "response.incomplete")
         {
@@ -261,10 +330,11 @@ impl Metrics {
             || value.pointer("/choices/0/message").is_some()
             || matches!(kind,"content_block_start"|"content_block_delta"|"response.output_text.delta"|"response.reasoning_summary_text.delta"|"response.function_call_arguments.delta");
         if has_content {self.first_valid_ms.get_or_insert(elapsed);}
-        let root = value
-            .get("response")
-            .or_else(|| value.get("message"))
-            .unwrap_or(value);
+        self.zen_nontext_output |= value.pointer("/choices/0/delta/reasoning_content").or_else(||value.pointer("/choices/0/message/reasoning_content")).and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+            || value.pointer("/choices/0/delta/tool_calls").or_else(||value.pointer("/choices/0/message/tool_calls")).and_then(Value::as_array).is_some_and(|v| !v.is_empty())
+            || (kind=="response.function_call_arguments.delta" && value.get("delta").and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
+            || (kind=="content_block_start" && value.pointer("/content_block/type").and_then(Value::as_str)==Some("tool_use"))
+            || value.pointer("/delta/thinking").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
         if let Some(usage) = root.get("usage").or_else(|| value.get("usage")) {
             if let Some(n)=usage.pointer("/completion_tokens_details/reasoning_tokens").or_else(||usage.pointer("/output_tokens_details/reasoning_tokens")).and_then(Value::as_u64) {self.reasoning_tokens=Some(n);}
             let cache_read = usage.pointer("/prompt_tokens_details/cached_tokens")
@@ -309,6 +379,7 @@ impl Metrics {
         }
         if let Some(blocks) = root.get("content").and_then(Value::as_array) {
             for block in blocks {
+                self.zen_nontext_output |= block.get("type").and_then(Value::as_str)==Some("tool_use");
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     text.push_str(t);
                 }
@@ -317,6 +388,7 @@ impl Metrics {
         if !self.sse {
             if let Some(output) = root.get("output").and_then(Value::as_array) {
                 for part in output {
+                    self.zen_nontext_output |= part.get("type").and_then(Value::as_str)==Some("function_call");
                     if let Some(blocks) = part.get("content").and_then(Value::as_array) {
                         for block in blocks {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
@@ -348,6 +420,8 @@ impl Metrics {
                 let line = line.trim_end_matches(['\r', '\n']);
                 if line.is_empty() {
                     self.flush_event(elapsed);
+                } else if let Some(name) = line.strip_prefix("event:") {
+                    self.event_name = name.trim().chars().take(64).collect();
                 } else if let Some(data) = line.strip_prefix("data:") {
                     if self.event_data.len() + data.len() < 128 * 1024 {
                         self.event_data.push_str(data.trim_start_matches(' '));
@@ -355,16 +429,19 @@ impl Metrics {
                     } else {
                         self.event_data.clear();
                         self.api_error = true;
+                        self.zen_stream_error = Some("Zen 上游 SSE 事件超出诊断解析上限");
                     }
                 }
             }
         }
         if self.pending.len() > 128 * 1024 {
             self.pending.clear();
+            self.zen_stream_error = Some("Zen 上游 SSE 行超出诊断解析上限");
         }
     }
     pub fn finish(&mut self, elapsed: u64) {
         if self.sse {
+            if self.pending.iter().any(|b| !b.is_ascii_whitespace()) || !self.event_data.is_empty() || !self.event_name.is_empty() {self.zen_stream_error.get_or_insert("Zen 上游 SSE 事件截断");}
             self.feed(b"\n\n", elapsed);
         } else if let Ok(value) = serde_json::from_slice(&self.json_body) {
             self.event(&value, elapsed);
@@ -374,11 +451,13 @@ impl Metrics {
     }
     fn flush_event(&mut self, elapsed: u64) {
         let data = std::mem::take(&mut self.event_data);
+        let name = std::mem::take(&mut self.event_name);
+        if matches!(name.as_str(), "error" | "response.failed" | "response.incomplete") {self.zen_stream_error=Some("Zen 上游返回 SSE 错误事件");}
         if data.trim() == "[DONE]" {
             self.completed = true;
         } else if let Ok(value) = serde_json::from_str(data.trim()) {
             self.event(&value, elapsed);
-        }
+        } else if !data.trim().is_empty() { self.zen_stream_error=Some("Zen 上游 SSE 数据格式无效"); }
     }
 }
 

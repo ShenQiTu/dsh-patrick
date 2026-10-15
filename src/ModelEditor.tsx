@@ -574,7 +574,7 @@ export function ModelEditor({
                 <div>
                   <span>
                     Zen 请求头（仅测试）{" "}
-                    <Help text="仅用于测试、保存并测试和批量测试；每次生成独立的 x-opencode-session。正常 DSH 对话继续沿用 DSH 插件的会话头，获取模型不受此开关影响。" />
+                    <Help text="仅用于测试、保存并测试和批量测试；每次生成独立会话，并以 x-opencode-session 与 x-opencode-session-id 一致发送。正常 DSH 对话继续沿用 DSH 插件的会话头，获取模型不受此开关影响。" />
                   </span>
                   <Switch
                     label="Zen 请求头（仅测试）"

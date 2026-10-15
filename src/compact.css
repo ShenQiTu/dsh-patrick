@@ -750,3 +750,5 @@ input[type="number"]::-webkit-outer-spin-button {
 .about-panel .app-logo {
   background: transparent;
 }
+
+.menu-status.failed { color: var(--red); border-color: var(--red-border); background: var(--red-soft); }

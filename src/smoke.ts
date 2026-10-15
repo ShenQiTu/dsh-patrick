@@ -38,7 +38,7 @@ export async function runSmoke() {
       "compact_window_no_horizontal_overflow",
     );
     assert(
-      document.querySelector("[data-dsh-status]")?.textContent === "未接管",
+      document.querySelector("[data-dsh-status]")?.textContent === "未配置",
       "sidebar_real_dsh_status",
     );
     assert(document.querySelector("img.icon-dsh"), "sidebar_dsh_asset");

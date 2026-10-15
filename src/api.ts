@@ -32,6 +32,8 @@ let preview: Snapshot = {
   gatewayRunning: false,
   gatewayAvailable: false,
   dshConnected: false,
+  dshRecoveryPending: false,
+  closeRequest: null,
   dsh: {profile:"",configured:false,modelCount:0,zenCount:0,message:"浏览器预览不读写 DSH 文件",backupDirectory:"",profileValid:false,checkedAt:0,syncState:"unchecked",checks:[]},
   trayAvailable: false,
   runtime: { lastDshRequest:0, port: 0, activeRequests: 0, calls: [], testResults: {}, historyVersion: 0, historyError: null },
@@ -164,6 +166,7 @@ export const api = {
     });
   },
   stop: () => invoke<void>("stop_gateway"),
+  resolveClose: (id:string, confirm:boolean) => invoke<void>("resolve_close", {id,confirm}),
   test: (id: string) => invoke<CallRecord>("test_model", { id }),
   cancel: (id: string) => invoke<void>("cancel_test", { id }),
   clearRecords: () => invoke<void>("clear_records"),

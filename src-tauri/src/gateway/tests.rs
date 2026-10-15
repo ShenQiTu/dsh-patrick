@@ -1123,6 +1123,8 @@ async fn zen_test_transport_retry_keeps_id_without_new_retry_policy_in_productio
         let seen = f.mock.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].headers["x-opencode-session"], seen[1].headers["x-opencode-session"]);
+        assert_eq!(seen[0].headers["x-opencode-session-id"], seen[1].headers["x-opencode-session-id"]);
+        assert_eq!(seen[0].headers["x-opencode-session"], seen[0].headers["x-opencode-session-id"]);
         assert_eq!(seen[0].body, seen[1].body);
         assert_eq!(seen[0].headers["authorization"], seen[1].headers["authorization"]);
     }
@@ -1158,6 +1160,7 @@ async fn zen_independent_concurrent_tests_and_case_insensitive_overrides() {
         let id = request.headers["x-opencode-session"].to_str().unwrap();
         assert!(protocol::valid_zen_session(id));
         assert!(ids.insert(id.to_owned()));
+        assert_eq!(request.headers["x-opencode-session-id"], id);
         assert_ne!(id, "ses_111111111111STATIC12345678");
         assert_eq!(request.headers["authorization"], "Bearer UNIT_TEST_UPSTREAM_KEY");
         assert_eq!(request.headers["user-agent"], "custom-agent");
@@ -1555,4 +1558,107 @@ async fn stream_idle_long_615_seconds() {
     assert_eq!(f.engine.slots.available_permits(),32);
     f.cleanup().await;
     println!("LONG_STREAM_PASS elapsed_ms={elapsed} old_total_seconds=610 actual_output_over_610=YES completed=DONE requests=1 slots=RELEASED loopback_only=YES");
+}
+
+#[test]
+fn zen_compat_alias_and_static_conflict() {
+    let mut model: Model = serde_json::from_value(json!({"id":"fixture","name":"fixture","model":"fixture","protocol":"openai","baseUrl":"https://example.invalid/v1","apiKey":"RELAY_SYNTHETIC_KEY","headers":{"X-OpenCode-Session":"ses_111111111111STATIC12345678","X-OpenCode-Session-Id":"ses_222222222222STATIC12345678"},"enabled":true,"reasoning":"default","prompt":""})).unwrap();
+    let session="ses_ecbe1a376ffe0123456789ABCD";
+    let mut incoming=HeaderMap::new();incoming.insert("X-OPENCODE-SESSION-ID",session.parse().unwrap());
+    incoming.insert("authorization","Bearer LOCAL_SYNTHETIC_TOKEN".parse().unwrap());
+    let out=protocol::outgoing_headers(&model,&incoming).unwrap();
+    assert_eq!(out["x-opencode-session"],session,"alias-only dynamic id must win");
+    assert_eq!(out["x-opencode-session-id"],session);
+    assert_eq!(out["authorization"],"Bearer RELAY_SYNTHETIC_KEY");
+    model.headers.clear();model.zen_test_enabled=true;
+    let test=test_headers(&model).unwrap();let out=protocol::outgoing_headers(&model,&test).unwrap();
+    assert_eq!(out["x-opencode-session"],out["x-opencode-session-id"]);
+    assert!(!protocol::outgoing_headers(&model,&HeaderMap::new()).unwrap().contains_key("x-opencode-session"));
+}
+
+#[test]
+fn zen_compat_header_matrix_and_completion() {
+    let a="ses_ecbe1a376ffe0123456789ABCD";let b="ses_ecbe1a375ffeABCDEFGHIJKLMN";
+    for (primary,alias,want,state) in [(Some(a),None,Some(a),"primary"),(None,Some(a),Some(a),"alias"),(Some(a),Some(a),Some(a),"both"),(Some(a),Some(b),Some(a),"conflict_primary"),(Some(" "),Some(b),Some(b),"alias"),(None,None,None,"absent"),(Some(""),Some(""),None,"absent")] {
+        let mut h=HeaderMap::new();if let Some(v)=primary {h.insert("X-OpenCode-Session",v.parse().unwrap());}if let Some(v)=alias{h.insert("X-OpenCode-Session-ID",v.parse().unwrap());}
+        let selected=protocol::zen_session(&h).unwrap();assert_eq!(selected.state,state);assert_eq!(selected.value.as_ref().and_then(|v|v.to_str().ok()),want);
+    }
+    for name in protocol::ZEN_SESSION_HEADERS {
+        for bad in ["bad","ses_ABCDEF0123450123456789ABCD","ses_123456789abc0123456789ABCD,other"] {
+            let mut h=HeaderMap::new();h.insert(name,bad.parse().unwrap());let error=protocol::zen_session(&h).err().unwrap();assert!(error.contains("格式无效"));assert!(!error.contains(bad));
+        }
+        let mut h=HeaderMap::new();h.append(name,a.parse().unwrap());h.append(name,b.parse().unwrap());assert!(protocol::zen_session(&h).err().unwrap().contains("冲突"));
+        h.clear();h.append(name,a.parse().unwrap());h.append(name,a.parse().unwrap());assert!(protocol::zen_session(&h).is_ok());
+    }
+    for (body,success) in [("data: [DONE]\n\n",false),(": heartbeat\n\n",false),("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\nevent: error\ndata: {\"message\":\"error\"}\n\ndata: [DONE]\n\n",false),("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]",false),("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",true)] {
+        let mut metrics=Metrics::new(true);metrics.feed(body.as_bytes(),1);metrics.finish(2);assert_eq!(metrics.zen_success(),success);
+    }
+    println!("ZEN_HEADERS_PASS primary_alias_conflict_case_invalid=OK completion=REAL_OUTPUT no_raw_headers=YES");
+}
+
+#[tokio::test]
+async fn zen_compat_real_http_three_protocols_and_diagnostics() {
+    let a="ses_ecbe1a376ffe0123456789ABCD";let b="ses_ecbe1a375ffeABCDEFGHIJKLMN";
+    for protocol_name in ["openai","responses","anthropic"] {
+        let f=Fixture::new(protocol_name).await;let port=f.engine.start_at(0).await.unwrap();let client=reqwest::Client::new();
+        let model=f.engine.config().unwrap().models[0].clone();
+        for (primary,alias,want,state) in [(Some(a),None,Some(a),"primary"),(None,Some(a),Some(a),"alias"),(Some(a),Some(a),Some(a),"both"),(Some(a),Some(b),Some(a),"conflict_primary"),(Some(""),Some(b),Some(b),"alias"),(None,None,None,"absent")] {
+            let mut req=client.post(format!("http://127.0.0.1:{port}/v1/{}",protocol::endpoint(protocol_name))).bearer_auth(f.token()).header("x-dsh-patrick","1").header("x-opencode-project","DO_NOT_FORWARD").json(&protocol::test_body(&model));
+            if let Some(v)=primary{req=req.header("X-OpenCode-Session",v);}if let Some(v)=alias{req=req.header("X-OPENCODE-SESSION-ID",v);}
+            let response=req.send().await.unwrap();assert_eq!(response.status(),200);let _=response.bytes().await.unwrap();
+            let seen=f.mock.seen.lock().unwrap().last().unwrap().clone();
+            for name in protocol::ZEN_SESSION_HEADERS {assert_eq!(seen.headers.get(name).and_then(|v|v.to_str().ok()),want);assert!(seen.headers.get_all(name).iter().count()<=1);}
+            assert!(!seen.headers.contains_key("x-dsh-patrick")&&!seen.headers.contains_key("x-opencode-project"));
+            assert_eq!(seen.headers[if protocol_name=="anthropic"{"x-api-key"}else{"authorization"}],if protocol_name=="anthropic"{"UNIT_TEST_UPSTREAM_KEY"}else{"Bearer UNIT_TEST_UPSTREAM_KEY"});
+            assert_ne!(seen.headers.get("authorization").and_then(|v|v.to_str().ok()),Some(f.token().as_str()));
+            let record=f.engine.runtime().unwrap().calls[0].clone();assert_eq!(record.state,"success");assert_eq!(record.zen_header_received,Some(primary.is_some()||alias.is_some()));assert_eq!(record.zen_header_sent,Some(want.is_some()));assert_eq!(record.zen_session_state.as_deref(),Some(state));
+            let json=serde_json::to_string(&record).unwrap();assert!(!json.contains(a)&&!json.contains(b)&&!json.contains(&f.token()));
+        }
+        let before=f.mock.seen.lock().unwrap().len();
+        for name in protocol::ZEN_SESSION_HEADERS {
+            let response=client.post(format!("http://127.0.0.1:{port}/v1/{}",protocol::endpoint(protocol_name))).bearer_auth(f.token()).header(name,"SYNTHETIC_INVALID").json(&protocol::test_body(&model)).send().await.unwrap();
+            assert_eq!(response.status(),400);let body=response.text().await.unwrap();assert!(body.contains("Zen")&&!body.contains("SYNTHETIC_INVALID"));
+        }
+        assert_eq!(f.mock.seen.lock().unwrap().len(),before);assert_eq!(f.engine.active.load(Ordering::SeqCst),0);
+        f.cleanup().await;
+    }
+    println!("ZEN_HTTP_PASS protocols=3 aliases=2 session_stable=YES auth_layers=SEPARATE invalid=400 diagnostics=REDACTED non_zen=UNCHANGED");
+}
+
+#[tokio::test]
+async fn zen_compat_proxy_errors_do_not_report_success() {
+    let f=Fixture::new("openai").await;let port=f.engine.start_at(0).await.unwrap();let client=reqwest::Client::new();
+    for (upstream,reason) in [("diag-error","错误"),("diag-empty","空响应"),("diag-malformed","格式"),("diag-length","长度"),("truncated","提前结束")] {
+        f.engine.store.lock().unwrap().config.models[0].model=upstream.into();
+        let response=client.post(format!("http://127.0.0.1:{port}/v1/chat/completions")).bearer_auth(f.token()).header("x-opencode-session-id","ses_ecbe1a376ffe0123456789ABCD").json(&protocol::test_body(&f.engine.config().unwrap().models[0])).send().await.unwrap();
+        assert_eq!(response.status(),200);let _=response.bytes().await.unwrap();
+        let record=f.engine.runtime().unwrap().calls[0].clone();assert_eq!(record.state,"error");assert!(record.message.contains(reason),"{}",record.message);assert_eq!(record.zen_header_sent,Some(true));
+        assert_eq!(f.engine.active.load(Ordering::SeqCst),0);assert_eq!(f.engine.slots.available_permits(),32);
+    }
+    f.cleanup().await;
+    println!("ZEN_PROXY_RESULTS_PASS http200_not_success=YES named_error=FAIL empty=FAIL malformed=FAIL length=FAIL truncated=FAIL slots=RELEASED");
+}
+
+#[test]
+fn zen_compat_structured_protocol_results() {
+    for (body,success) in [
+        (json!({"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"error":null}),true),
+        (json!({"status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}),true),
+        (json!({"status":"failed","error":{"message":"synthetic"},"output":[{"type":"message","content":[{"text":"partial"}]}]}),false),
+        (json!({"status":"incomplete","error":null,"output":[{"type":"message","content":[{"text":"partial"}]}]}),false),
+        (json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),false),
+        (json!({"content":[{"type":"tool_use","id":"synthetic","name":"local_tool","input":{}}],"stop_reason":"tool_use"}),true),
+        (json!({"choices":[{"message":{"reasoning_content":"thought"},"finish_reason":"stop"}]}),true),
+    ] {
+        let mut metrics=Metrics::new(false);metrics.feed(&serde_json::to_vec(&body).unwrap(),1);metrics.finish(2);
+        assert_eq!(metrics.zen_success(),success,"structured Zen result: {}",body);
+    }
+    for (body,success) in [
+        ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null}}\n\n",true),
+        ("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"error\":null}}\n\n",false),
+        ("data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null}}\n\n",true),
+    ] {
+        let mut metrics=Metrics::new(true);metrics.feed(body.as_bytes(),1);metrics.finish(2);assert_eq!(metrics.zen_success(),success);
+    }
+    println!("ZEN_STRUCTURED_PASS null_error=SUCCESS partial_failed=ERROR nonstream_max_tokens=ERROR reasoning_and_tools=SUCCESS");
 }

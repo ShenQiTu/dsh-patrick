@@ -53,6 +53,8 @@ export interface Snapshot {
   gatewayRunning: boolean;
   gatewayAvailable: boolean;
   dshConnected: boolean;
+  dshRecoveryPending: boolean;
+  closeRequest: {id:string; exit:boolean; message:string} | null;
   dsh: {profile:string; configured:boolean; modelCount:number; zenCount:number; message:string; backupDirectory:string;profileValid:boolean;checkedAt:number;syncState:string;checks:{id:string;label:string;state:"pass"|"fail"|"unchecked";detail:string}[]};
   trayAvailable: boolean;
   runtime: {
@@ -89,6 +91,7 @@ export interface CallRecord {
   status: number;
   zenHeaderReceived: boolean | null;
   zenHeaderSent: boolean | null;
+  zenSessionState?: string | null;
   durationMs: number;
   firstTokenMs: number | null;
   inputTokens: number | null;
@@ -136,4 +139,15 @@ export function emptyModel(): ModelInput {
     extraParams: {},
     thinkingBudget: null,
   };
+}
+
+// This is configuration verification, not whether the listener is running or a model answered.
+export function dshConnectionLabel(s: Snapshot | null): string {
+  if (!s) return "待核对";
+  if (s.dshRecoveryPending) return "待恢复";
+  if (!s.settings.dshProfile.trim()) return "未配置";
+  if (s.dsh.profile !== s.settings.dshProfile || !s.dsh.checkedAt) return "待核对";
+  if (!s.dsh.profileValid || s.dsh.syncState === "error" || s.dsh.checks.some(c=>c.state === "fail")) return "核验失败";
+  if (s.dsh.configured) return "已同步";
+  return s.dsh.syncState === "unchecked" ? "待核对" : "未同步";
 }

@@ -23,6 +23,7 @@ use tauri::{Emitter, Manager};
 struct AppState {
     dsh: Mutex<dsh::Status>,
     integration_control: tokio::sync::Mutex<()>,
+    close_request: Mutex<Option<lifecycle::CloseRequest>>,
     store: Arc<Mutex<Store>>,
     gateway: Arc<gateway::Gateway>,
     directory: PathBuf,
@@ -37,12 +38,20 @@ impl AppState {
         let directory=self.directory.clone();
         let config=self.store.lock().map_err(|_| "配置锁异常")?.config.clone();
         let port=self.gateway.runtime()?.port;
+        let resolves_recovery=matches!(action,"sync"|"disconnect");
         let action=action.to_owned();
         let profile=config.settings.dsh_profile.clone();
         let result=tauri::async_runtime::spawn_blocking(move || dsh::execute_detailed(&directory,&config,&action,port)).await.unwrap_or_else(|_|Err(dsh::Failure::from("DSH 接入任务异常")));
         let mut status=self.dsh.lock().map_err(|_| "接入状态锁异常")?;
         match result {
-            Ok(value)=>{*status=value;Ok(())}
+            Ok(value)=>{
+                *status=value;
+                if resolves_recovery {
+                    lifecycle::clear_recovery(&self.directory,&profile)?;
+                    *self.close_request.lock().map_err(|_| "退出状态锁异常")?=None;
+                }
+                Ok(())
+            }
             Err(error)=>{let message=error.message.clone();*status=dsh::Status::failed(profile,error);Err(message)}
         }
     }
@@ -50,15 +59,51 @@ impl AppState {
         if self.gateway.running() && !self.smoke { self.bridge("sync").await.map_err(|e|format!("模型已保存在 Patrick，但 DSH 同步失败：{e}"))?; }
         Ok(())
     }
-    async fn disconnect(&self) -> Result<(), String> {
+    async fn disconnect(&self) -> Result<(), String> { self.request_close(false).await }
+    async fn request_close(&self, exit: bool) -> Result<(), String> {
         let _control=self.integration_control.lock().await;
+        *self.close_request.lock().map_err(|_| "退出状态锁异常")?=None;
         let _pause=self.gateway.pause_if_idle()?;
         if !self.smoke {
             let profile=self.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
-            if dsh::owns_integration(&self.directory,&profile)? { self.bridge("disconnect").await?; }
-            else { *self.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status {profile,message:"网关已断开；请点击检查状态重新核对配置".into(),..Default::default()}; }
+            let restore=match dsh::owns_integration(&self.directory,&profile) {
+                Ok(true)=>self.bridge("disconnect").await,
+                Ok(false)=>{
+                    *self.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status {profile:profile.clone(),message:"网关已断开；请点击检查状态重新核对配置".into(),..Default::default()};
+                    Ok(())
+                },
+                Err(error)=>{
+                    *self.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status::failed(profile.clone(),dsh::Failure::from(error.clone()));
+                    Err(error)
+                },
+            };
+            if let Err(message)=restore {
+                self.offer_close(exit,profile,message.clone())?;
+                return Err(message);
+            }
         }
         self.gateway.stop().await
+    }
+    fn offer_close(&self, exit:bool, profile:String, message:String) -> Result<(),String> {
+        *self.close_request.lock().map_err(|_| "退出状态锁异常")?=Some(lifecycle::CloseRequest {id:config::new_id(),exit,profile,message});
+        Ok(())
+    }
+    async fn resolve_close_request(&self, id:&str, confirm:bool) -> Result<bool,String> {
+        let _control=self.integration_control.lock().await;
+        let request=self.close_request.lock().map_err(|_| "退出状态锁异常")?.clone()
+            .filter(|r| r.id==id).ok_or("退出确认已失效，请重新操作")?;
+        if !confirm { *self.close_request.lock().map_err(|_| "退出状态锁异常")?=None; return Ok(false); }
+        let _pause=self.gateway.pause_if_idle()?;
+        let profile=self.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
+        if request.profile!=profile {return Err("DSH 路径已变化，请取消后重新操作".into());}
+        // Only our encrypted reminder is written. No restore script or DSH file is touched.
+        lifecycle::mark_recovery(&self.directory,&profile)?;
+        self.gateway.stop().await?;
+        let mut status=self.dsh.lock().map_err(|_| "接入状态锁异常")?;
+        status.configured=false;status.sync_state="recovery_pending".into();
+        status.message="网关已停止；DSH 配置、凭据及恢复记录已保留，接入恢复待处理".into();
+        *self.close_request.lock().map_err(|_| "退出状态锁异常")?=None;
+        Ok(request.exit)
     }
 }
 #[tauri::command]
@@ -85,6 +130,8 @@ struct Snapshot {
     gateway_running: bool,
     gateway_available: bool,
     dsh_connected: bool,
+    dsh_recovery_pending: bool,
+    close_request: Option<lifecycle::CloseRequest>,
     dsh: dsh::Status,
     tray_available: bool,
     runtime: gateway::RuntimeView,
@@ -106,6 +153,8 @@ fn snapshot(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<Snap
         gateway_running: state.gateway.running(),
         gateway_available: true,
         dsh_connected: dsh.configured,
+        dsh_recovery_pending: lifecycle::recovery_pending(&state.directory,&store.config.settings.dsh_profile),
+        close_request: state.close_request.lock().map_err(|_| "退出状态锁异常")?.clone(),
         dsh,
         tray_available: app.tray_by_id("patrick-tray").is_some(),
         runtime: state.gateway.runtime()?,
@@ -197,6 +246,12 @@ async fn start_gateway(state: tauri::State<'_, AppState>) -> Result<u16, String>
 #[tauri::command]
 async fn stop_gateway(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.disconnect().await
+}
+#[tauri::command]
+async fn resolve_close(app: tauri::AppHandle, state: tauri::State<'_,AppState>, id:String, confirm:bool) -> Result<(),String> {
+    let exit=state.resolve_close_request(&id,confirm).await?;
+    if exit && !state.smoke {app.exit(0);}
+    Ok(())
 }
 #[tauri::command]
 async fn test_model(
@@ -306,6 +361,17 @@ async fn smoke_lifecycle(app: tauri::AppHandle, state: tauri::State<'_, AppState
         "show" => { lifecycle::show(&app)?; Ok(true) }
         "visible" => app.get_webview_window("main").ok_or("窗口未就绪")?.is_visible().map_err(|e| e.to_string()),
         "exit-check" => { lifecycle::prepare_exit(&app).await?; Ok(true) }
+        "recovery-offer-stop" | "recovery-offer-exit" => {
+            state.gateway.start_at(0).await?;
+            let profile=state.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
+            {let mut status=state.dsh.lock().map_err(|_| "接入状态锁异常")?;status.configured=false;status.sync_state="error".into();}
+            state.offer_close(action=="recovery-offer-exit",profile,"合成配置冲突；当前文件已保留".into())?;
+            Ok(true)
+        }
+        "recovery-reset" => {
+            let profile=state.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
+            lifecycle::clear_recovery(&state.directory,&profile)?;Ok(true)
+        }
         "bridge-self-contained" => {
             let directory=state.directory.clone();
             tauri::async_runtime::spawn_blocking(move || dsh::smoke_probe(&directory)).await.map_err(|_| "接入组件自测任务异常")??;
@@ -404,11 +470,11 @@ fn main() {
     }
     let visual_review = smoke && std::env::var("DSH_PATRICK_SMOKE_SHOW").as_deref() == Ok("1");
     let result=tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,test_model,cancel_test,clear_records,call_detail,clear_call_details,save_pricing,statistics_storage,clear_statistics,autostart_status,set_autostart,check_update,open_release_page,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
+        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,resolve_close,test_model,cancel_test,clear_records,call_detail,clear_call_details,save_pricing,statistics_storage,clear_statistics,autostart_status,set_autostart,check_update,open_release_page,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
         .setup(move|app|{
             let store=Arc::new(Mutex::new(Store::open(directory.clone()).map_err(std::io::Error::other)?));
             let gateway=gateway::Gateway::new(store.clone()).map_err(std::io::Error::other)?;
-            app.manage(AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),store,gateway,directory,smoke,autostart_key:if smoke {desktop_settings::test_key()} else {desktop_settings::STARTUP_KEY.into()},smoke_finished: std::sync::atomic::AtomicBool::new(false)});
+            app.manage(AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke,autostart_key:if smoke {desktop_settings::test_key()} else {desktop_settings::STARTUP_KEY.into()},smoke_finished: std::sync::atomic::AtomicBool::new(false)});
             tauri::WebviewWindowBuilder::new(app,"main",tauri::WebviewUrl::App("index.html".into()))
                 .title(if visual_review{format!("DSH Patrick v{} — 本机模拟验证",env!("CARGO_PKG_VERSION"))}else{format!("DSH Patrick v{}",env!("CARGO_PKG_VERSION"))}).inner_size(960.0,640.0).min_inner_size(800.0,520.0)
                 .decorations(false).visible(!smoke||visual_review).data_directory(webview)

@@ -97,10 +97,22 @@ function yamlTools() {
 }
 function plain(node) {return node?.toJSON ? node.toJSON() : node;}
 function matches(value, entries) {return (entries??[]).some(s=>typeof s==='string'&&(s.endsWith('*')?value.toUpperCase().startsWith(s.slice(0,-1).toUpperCase()):s.toUpperCase()===value.toUpperCase()));}
+function zenPolicy(row) {
+  const config=plain(row?.get('config'))??{};
+  if(config.models!==undefined && !Array.isArray(config.models))fail('profile/cordis.patch.yml 的 llm-zen-session-headers.config.models 不是列表；请核对该项结构');
+  const legacy=Array.isArray(config.models)&&config.models.length>0;
+  if(config.providers!==undefined && (!Array.isArray(config.providers)||config.providers.some(p=>typeof p!=='string'||!/^[^\s*]+$/.test(p))))fail('Zen providers 规则格式无效');
+  if(config.routes!==undefined && (!Array.isArray(config.routes)||config.routes.some(r=>!r||typeof r.provider!=='string'||!/^[^\s*]+$/.test(r.provider)||!Array.isArray(r.models)||!r.models.length||r.models.some(m=>typeof m!=='string'||!/^[^\s*]+\*?$/.test(m)))))fail('Zen routes 规则格式无效');
+  if(legacy && config.routes!==undefined)fail('Zen 新版 routes 与旧全局 models 混用；请先在 DSH 完成规则迁移');
+  return {config,legacy};
+}
+function scopedZen(config,provider,model) {
+  return (config.providers??[]).includes(provider)||(config.routes??[]).some(r=>r.provider===provider&&r.models.some(m=>m.endsWith('*')?model.startsWith(m.slice(0,-1)):m===model));
+}
+function ownedZenRoutes(journal) {return journal.zenRoutes??[];}
 function generate(y,doc,input,ref) {
-  const existing=plain(y.providers(doc)); const managed={};const zenIds=[];
-  const zenRow=y.row(doc,'llm-zen-session-headers');const zen=plain(zenRow?.get('config'));
-  if(zenRow && zen?.models!==undefined && !Array.isArray(zen.models))fail('Zen models 不是列表');
+  const existing=plain(y.providers(doc)); const managed={};const zenIds=[];const zenRoutes=[];let zenAmbiguous=0;
+  const zenRow=y.row(doc,'llm-zen-session-headers');const {config:zen,legacy}=zenPolicy(zenRow);
   const api={openai:'openai-completions',responses:'openai-responses',anthropic:'anthropic-messages'};
   for(const model of input.models) {
     if(!/^[a-zA-Z0-9_-]{1,100}$/.test(model.id)||!api[model.protocol])fail('本机模型 ID 或协议无效');
@@ -117,9 +129,19 @@ function generate(y,doc,input,ref) {
     const route='dsh-patrick-'+model.protocol;
     managed[route]??={displayName:'DSH Patrick · '+model.protocol,api:api[model.protocol],baseURL:`http://127.0.0.1:${input.port}`+(model.protocol==='anthropic'?'':'/v1'),apiKeyEnv:ref,headers:{'x-dsh-patrick':'1'},models:[]};
     managed[route].models.push(local);
-    if(zenRow && zenRow.get('disabled')!==true && zen?.enabled!==false && (matches(model.model,zen?.models)||definitions.some(d=>matches(d.route,zen?.providers))))zenIds.push(model.id);
+    if(zenRow && zenRow.get('disabled')!==true && zen.enabled!==false) {
+      if(legacy) {
+        if(matches(model.model,zen.models)||definitions.some(d=>matches(d.route,zen.providers)))zenIds.push(model.id);
+      } else if(definitions.length>1 && definitions.some(d=>scopedZen(zen,d.route,model.model)) && !scopedZen(zen,route,model.id)) {
+        zenAmbiguous++;
+      } else if(definition && (!definition.p.api||definition.p.api===api[model.protocol]) && scopedZen(zen,definition.route,model.model) && !scopedZen(zen,route,model.id)) {
+        // No source-provider identity is stored by Patrick: ambiguous same-name models are not inferred.
+        let rule=zenRoutes.find(r=>r.provider===route);if(!rule){rule={provider:route,models:[]};zenRoutes.push(rule);}
+        if(!rule.models.includes(model.id))rule.models.push(model.id);
+      }
+    }
   }
-  return {providers:managed,zenIds};
+  return {providers:managed,zenIds,zenRoutes,zenAmbiguous};
 }
 function removeOwned(y,current,journal) {
   const result={...current};
@@ -136,7 +158,20 @@ function removeOwned(y,current,journal) {
         p.delete(name);
       }
       const row=y.row(doc,'llm-zen-session-headers');
-      if(journal.zenIds.length && row) {
+      if(ownedZenRoutes(journal).length) {
+        const list=row?.getIn(['config','routes']);
+        if(!y.isSeq(list))fail('Zen routes 规则被外部改写，请核对后重试恢复');
+        const owned=ownedZenRoutes(journal),baseline=plain(y.row(y.parse(journal.before.profile),'llm-zen-session-headers')?.getIn(['config','routes']))??[];
+        for(const rule of owned) {
+          const exact=list.items.filter(n=>equal(plain(n),rule));
+          if(exact.length>1 || (!exact.length && list.items.some(n=>plain(n)?.provider===rule.provider && !owned.some(r=>equal(r,plain(n))) && !baseline.some(r=>equal(r,plain(n))))))fail('Zen routes 归属规则被外部修改，请核对后重试恢复');
+        }
+        list.items=list.items.filter(n=>!owned.some(r=>equal(r,plain(n))));
+        if(!list.items.length && !y.row(y.parse(journal.before.profile),'llm-zen-session-headers')?.hasIn(['config','routes']))row.deleteIn(['config','routes']);
+      }
+      // A separate plugin migration may already have removed the legacy global list.
+      // Its new scoped rules are not ours: keep them, and only clean legacy IDs still present.
+      if(journal.zenIds.length && row?.hasIn(['config','models'])) {
         const list=row.getIn(['config','models']);
         if(!y.isSeq(list))fail('Zen 规则被外部改写，请核对后重试恢复');
         list.items=list.items.filter(n=>!journal.zenIds.includes(plain(n)));
@@ -179,6 +214,7 @@ function readJournal(file) {
     fail('.dsh-patrick/journal.json 格式错误；请保留接入记录与备份，核对后再恢复');
   }
   if(!j || typeof j.owner!=='string' || !['active','pending'].includes(j.phase) || !Array.isArray(j.routes) || !Array.isArray(j.zenIds) || typeof j.ref!=='string'
+      || (j.zenRoutes!==undefined&&(!Array.isArray(j.zenRoutes)||j.zenRoutes.some(r=>!r||typeof r.provider!=='string'||!Array.isArray(r.models))))
       || !j.before || !j.after || ['profile','credentials'].some(k=>typeof j.before[k]!=='string'||typeof j.after[k]!=='string'))
     fail('.dsh-patrick/journal.json 格式不完整；请保留接入记录与备份，核对后再恢复');
   return j;
@@ -219,7 +255,7 @@ async function runChecked(input,diagnostics) {
     step('providers',()=>{
       y.providers(doc);
       const zen=y.row(doc,'llm-zen-session-headers');
-      if(zen?.hasIn(['config','models'])&&!y.isSeq(zen.getIn(['config','models'])))fail('profile/cordis.patch.yml 的 llm-zen-session-headers.config.models 不是列表；请核对该项结构');
+      zenPolicy(zen);
     },'已找到启用的 llm-pi-ai 及可编辑的 config.providers');
     step('overlay',()=>{
       const overlayFile=path.join(home,'cordis.patch.yml');ordinary(overlayFile);
@@ -253,8 +289,9 @@ async function runChecked(input,diagnostics) {
     removeOwned(y,current,j); // Conflict check without writes.
     const d=y.parse(current.profile), c=y.parse(current.credentials), e=y.parse(j.after.profile);
     const rules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','models']))??[];
-    const configured=j.routes.every(r=>equal(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
-    return {...status,configured,modelCount:j.modelCount,zenCount:j.zenIds.length,message:configured?'配置已同步；DSH 是否加载以客户端模型列表及请求记录为准':'配置已变化，请重新同步',backupDirectory:directory};
+    const scopedRules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','routes']))??[];
+    const configured=ownedZenRoutes(j).every(rule=>scopedRules.some(r=>equal(r,rule))) && j.routes.every(r=>equal(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
+    return {...status,configured,modelCount:j.modelCount,zenCount:j.zenIds.length+ownedZenRoutes(j).reduce((n,r)=>n+r.models.length,0),message:configured?'配置已同步；DSH 是否加载以客户端模型列表及请求记录为准'+(j.zenAmbiguous?`；${j.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''):'配置已变化，请重新同步',backupDirectory:directory};
   }
   privateDirectory(directory);
   return lock(path.join(profile,'package.json'),()=>lock(credentials,async()=>{
@@ -288,8 +325,13 @@ async function runChecked(input,diagnostics) {
       generated.zenIds=generated.zenIds.filter(id=>!existingRules.includes(id));
       for(const id of generated.zenIds)z.getIn(['config','models']).add(id);
     }
+    if(generated.zenRoutes.length) {
+      const row=y.row(doc,'llm-zen-session-headers');
+      if(!row.hasIn(['config','routes']))row.setIn(['config','routes'],doc.createNode([]));
+      for(const rule of generated.zenRoutes)row.getIn(['config','routes']).add(doc.createNode(rule));
+    }
     const after={profile:String(doc),credentials:String(c)};
-    const journal={version:1,phase:'pending',owner:input.owner,pid:input.pid,ref,credentialsExisted:old?.credentialsExisted??exists(credentials),routes:[...new Set([...Object.keys(generated.providers),...(old?.routes??[])])],zenIds:[...new Set([...generated.zenIds,...(old?.zenIds??[])])],modelCount:input.models.length,before:base,after};
+    const journal={version:1,phase:'pending',owner:input.owner,pid:input.pid,ref,credentialsExisted:old?.credentialsExisted??exists(credentials),routes:[...new Set([...Object.keys(generated.providers),...(old?.routes??[])])],zenIds:[...new Set([...generated.zenIds,...(old?.zenIds??[])])],zenRoutes:[...generated.zenRoutes,...(old?.zenRoutes??[])].filter((r,i,a)=>a.findIndex(v=>equal(v,r))===i),zenAmbiguous:generated.zenAmbiguous,modelCount:input.models.length,before:base,after};
     if(!old) {
       const backup=path.join(directory,'backup-'+Date.now()+'-'+crypto.randomBytes(4).toString('hex'));fs.mkdirSync(backup,{mode:0o700});
       fs.writeFileSync(path.join(backup,'cordis.patch.yml'),base.profile,{flag:'wx',mode:0o600});
@@ -302,7 +344,7 @@ async function runChecked(input,diagnostics) {
     try {
       if(read(file)!==beforeRead.profile || (exists(credentials)?read(credentials):'version: 1\nrefs: {}\n')!==beforeRead.credentials)fail('DSH 文件在同步期间发生变化，请重试');
       await atomic(credentials,after.credentials,directory);await atomic(file,after.profile,directory);
-      journal.phase='active';journal.routes=Object.keys(generated.providers);journal.zenIds=generated.zenIds;delete journal.previous;
+      journal.phase='active';journal.routes=Object.keys(generated.providers);journal.zenIds=generated.zenIds;journal.zenRoutes=generated.zenRoutes;delete journal.previous;
       await atomic(stateFile,JSON.stringify(journal),directory);
     } catch(e) {
       // Roll back only bytes still owned by this transaction, never an intervening edit.
@@ -314,7 +356,7 @@ async function runChecked(input,diagnostics) {
       }
       throw e;
     }
-    return {...status,configured:true,modelCount:input.models.length,zenCount:generated.zenIds.length,message:'配置已同步；请在 DSH 选择 DSH Patrick 下的模型',backupDirectory:directory};
+    return {...status,configured:true,modelCount:input.models.length,zenCount:generated.zenIds.length+generated.zenRoutes.reduce((n,r)=>n+r.models.length,0),message:'配置已同步；请在 DSH 选择 DSH Patrick 下的模型'+(generated.zenAmbiguous?`；${generated.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''),backupDirectory:directory};
   }));
 }
 module.exports={run,generate,yamlTools,removeOwned,hash};

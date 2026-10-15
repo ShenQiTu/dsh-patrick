@@ -26,6 +26,7 @@
 !/tools/dsh-bridge.test.cjs
 !/tools/dsh-standalone.test.cjs
 !/tools/dsh-diagnostics.test.cjs
+!/tools/zen-compat.test.cjs
 !/tools/build-bridge.mjs
 !/tools/package-runtime.ps1
 !/tools/dsh-runtime.test.mjs

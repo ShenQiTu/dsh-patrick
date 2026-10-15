@@ -11,11 +11,13 @@ const {default:LlmRuntime,BlockAssembler,createUserMessage}=await load('@deepsee
 const Pi=await load('@deepseek-ai/dsh-llm-pi-ai');
 const zenPath=path.join(source,'packages/llm/llm-zen-session-headers/lib/index.js');
 const Zen=await import(pathToFileURL(zenPath).href);
+const zenRequire=createRequire(path.join(source,'packages/llm/llm-zen-session-headers/package.json'));
+const {SessionStore,SessionId}=await import(pathToFileURL(zenRequire.resolve('@deepseek-ai/dsh-session')).href);
 const require=createRequire(import.meta.url);
 const {generate,yamlTools}=require('../src-tauri/src/dsh_bridge.cjs');
 const y=yamlTools();
 // Synthetic declarations only, never parse the real DSH configuration here.
-const doc=y.parse('- id: llm-pi-ai\n  config:\n    providers: {}\n- id: llm-zen-session-headers\n  config: {enabled: true, models: [zen-free], providers: []}\n');
+const doc=y.parse('- id: llm-pi-ai\n  config:\n    providers: {zen: {api: openai-completions, models: [{id: zen-free}]}}\n- id: llm-zen-session-headers\n  config: {enabled: true, routes: [{provider: zen, models: [zen-free]}], providers: []}\n');
 const observed=[];
 const server=createServer((request,response)=>{
   let body='';request.on('data',s=>body+=s);request.on('end',()=>{
@@ -54,7 +56,9 @@ process.env.DSH_PATRICK_RUNTIME_TEST=input?.token??'patrick_'+'b'.repeat(64);
 const ctx=new Context();let checks=0;
 try {
   assert(req.resolve('@deepseek-ai/dsh-llm-pi-ai').startsWith(source));checks++;
-  await ctx.plugin(LlmRuntime);await ctx.plugin(Pi,{providers:generated.providers});await ctx.plugin(Zen,{enabled:true,providers:[],models:generated.zenIds});
+  await ctx.plugin(LlmRuntime);await ctx.plugin(SessionStore);
+  for(const id of ['session-A','session-B'])ctx.sessions.create(SessionId(id),{meta:{createdAt:1791875767433}});
+  await ctx.plugin(Pi,{providers:generated.providers});await ctx.plugin(Zen,{enabled:true,providers:[],routes:generated.zenRoutes});
   for(const model of models) {
     const route='dsh-patrick-'+model.protocol;
     const catalog=await ctx.llm.listModels(route);assert(catalog.some(m=>m.id===model.id));checks++;
@@ -72,8 +76,8 @@ try {
       assert(requests.every(r=>r.path===expected));checks++;
       assert(requests.every(r=>r.headers['x-dsh-patrick']==='1'));checks++;
       assert(requests.every(r=>r.headers.authorization==='Bearer '+process.env.DSH_PATRICK_RUNTIME_TEST||r.headers['x-api-key']===process.env.DSH_PATRICK_RUNTIME_TEST));checks++;
-      if(m.id==='pzen') {const h=requests.map(r=>r.headers['x-opencode-session']);assert(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(h[0]));assert.equal(h[0],h[1]);assert.notEqual(h[0],h[2]);checks+=3;}
-      else {assert(requests.every(r=>!r.headers['x-opencode-session']));checks++;}
+      if(m.id==='pzen') {assert(requests.every(r=>r.headers['x-opencode-session']===r.headers['x-opencode-session-id']));checks++;const h=requests.map(r=>r.headers['x-opencode-session']);assert(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(h[0]));assert.equal(h[0],h[1]);assert.notEqual(h[0],h[2]);checks+=3;}
+      else {assert(requests.every(r=>!r.headers['x-opencode-session']&&!r.headers['x-opencode-session-id']));checks++;}
     }
   }
   console.log(`DSH_RUNTIME PASS checks=${checks} protocols=${Object.keys(generated.providers).length} loopback_only=YES exit=0`);

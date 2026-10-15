@@ -116,7 +116,7 @@ export function CallDetails({ record, onClose }: { record: CallRecord; onClose: 
         {tab === "info" && <>
           {info.legacy && <p className="call-note">旧版历史摘要：模型、耗时、请求和响应正文未记录；已有统计保持原样。</p>}
           <dl className="call-info-grid">{rows.map(([label,value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
-          <div className="call-note" data-zen-status>Zen 请求头：{r.source === "test" ? "本机测试" : `客户端：${r.zenHeaderReceived == null ? "—" : r.zenHeaderReceived ? "已收到" : "未收到"}`} · 上游 {r.zenHeaderSent == null ? "—" : r.zenHeaderSent ? "已携带" : "未携带"}（仅表示头存在，不代表上游认可）</div>
+          <div className="call-note" data-zen-status>Zen 请求头：{r.source === "test" ? "本机测试" : `客户端：${r.zenHeaderReceived == null ? "—" : r.zenHeaderReceived ? "已收到" : "未收到"}`} · 上游 {r.zenHeaderSent == null ? "—" : r.zenHeaderSent ? "已携带" : "未携带"}（仅表示头存在，不代表上游认可）{r.zenSessionState && <span data-zen-session-state> · {({absent:"未提供有效动态会话头",primary:"旧会话头有效，双头已统一",alias:"别名会话头有效，双头已统一",both:"双会话头一致",conflict_primary:"双头冲突，已按 x-opencode-session 统一"} as Record<string,string>)[r.zenSessionState] || "—"}</span>}</div>
           {r.preview && <section className="response-preview"><h3>测试响应预览</h3><pre>{r.preview}</pre><small>最多 500 字符；预览仅在本次运行保留。</small></section>}
           <p className="call-note">“—” 表示未上报或不适用。思考强度来自实际发出的请求，不猜测服务商默认值；Token 不用字符数估算。</p>
         </>}

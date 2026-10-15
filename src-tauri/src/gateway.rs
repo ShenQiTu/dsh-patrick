@@ -81,6 +81,8 @@ pub struct CallRecord {
     pub zen_header_received: Option<bool>,
     #[serde(default)]
     pub zen_header_sent: Option<bool>,
+    #[serde(default)]
+    pub zen_session_state: Option<String>,
     pub duration_ms: u64,
     pub first_token_ms: Option<u64>,
     pub input_tokens: Option<u64>,
@@ -557,7 +559,8 @@ impl Gateway {
         }
         let body = protocol::prepare_body(model, body)?;
         let headers = protocol::outgoing_headers(model, &incoming)?;
-        let zen_header = headers.contains_key("x-opencode-session");
+        let zen_header = protocol::has_zen_header(&headers);
+        guard.record.zen_session_state = Some(protocol::zen_session(&incoming)?.state.into());
         guard.observe_request(&url, &body, &headers);
         let streamed_request = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let request = self.client.post(url).headers(headers).json(&body);
@@ -755,7 +758,7 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
     if parts.headers.get("x-dsh-patrick").and_then(|h|h.to_str().ok())==Some("1") {
         engine.last_dsh_request.store(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,Ordering::SeqCst);
     }
-    guard.record.zen_header_received = Some(parts.headers.contains_key("x-opencode-session"));
+    guard.record.zen_header_received = Some(protocol::has_zen_header(&parts.headers));
     let stream_wait = value.get("stream").and_then(Value::as_bool).unwrap_or(false)
         .then_some(config.settings.stream_wait_seconds());
     let (response, zen_header) = match engine
@@ -806,14 +809,14 @@ async fn proxy(State(engine): State<Arc<Gateway>>, request: Request) -> Response
                 Ok(None) => {
                     let g = guard.as_mut().unwrap();
                     g.metrics.finish(g.elapsed());
-                    let ok = !g.metrics.api_error && g.metrics.completed;
+                    let ok = if zen_header { g.metrics.zen_success() } else { !g.metrics.api_error && g.metrics.completed };
                     g.finish(
                         if ok { "success" } else { "error" },
                         g.record.status,
                         if ok {
                             "请求完成"
                         } else {
-                            "上游流缺少结束事件或返回错误"
+                            if zen_header { g.metrics.zen_failure().unwrap_or("Zen 响应未完成") } else { "上游流缺少结束事件或返回错误" }
                         },
                     );
                     None
@@ -874,6 +877,7 @@ impl RecordGuard {
             status: 0,
             zen_header_received: None,
             zen_header_sent: None,
+            zen_session_state: None,
             duration_ms: 0,
             first_token_ms: None,
             input_tokens: None,

@@ -22,13 +22,14 @@ export async function runCallsRegression() {
   (q('.settings-groups') as HTMLFormElement).requestSubmit();
   await until(async()=> (await api.snapshot()).settings.detailedLogging,"detail option saved");
   const state=await api.snapshot();
-  const id=await api.save({...emptyModel(),name:"Calls detail fixture",model:"native-mock",baseUrl:state.testUpstream!,apiKey:"SYNTHETIC_CALLS_KEY"});
+  const id=await api.save({...emptyModel(),name:"Calls detail fixture",model:"native-mock",baseUrl:state.testUpstream!,apiKey:"SYNTHETIC_CALLS_KEY",zenTestEnabled:true});
   const result=await api.test(id);check(result.state==="success","detailed_test_success");
   await click('[data-nav="calls"]');await click('[aria-label="刷新"]');
   await until(()=>!!q('[aria-label="查看详情 Calls detail fixture"]'),"actual call in table");
   await click('[aria-label="查看详情 Calls detail fixture"]');
   await until(()=>!!q('.call-info-grid'),"details metadata");
   check(q('.call-info-grid').textContent?.includes('native-mock'),"actual_model_in_details");
+  check(q('[data-zen-session-state]')?.textContent?.includes('双头已统一'),"zen_normalized_diagnostic_visible");
   await click('#call-tab-button-request');
   await until(()=>!!q('[data-call-request]'),"request payload loaded");
   check(q('[data-call-request]').textContent?.includes('native-mock'),"actual_request_body_tab");

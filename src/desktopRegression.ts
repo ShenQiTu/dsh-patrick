@@ -1,6 +1,6 @@
 import { api } from "./api";
 import { invoke } from "@tauri-apps/api/core";
-import { emptyModel } from "./types";
+import { emptyModel, dshConnectionLabel } from "./types";
 export async function runDesktopRegression() {
   const checks: string[] = [];
   const sleep = () => new Promise(r=>setTimeout(r,80));
@@ -50,6 +50,7 @@ export async function runDesktopRegression() {
     await invoke("smoke_lifecycle",{action:`diagnostics-${scenario}`});await click('[aria-label="刷新"]');
     await until(()=>q('[data-dsh-stage="directory"]').dataset.state===(scenario==="invalid"?"fail":"pass"));
     check(q('[data-dsh-stage="sync"]').dataset.state===(scenario==="synced"?"pass":"unchecked"),`diagnostics_sync_separate_${scenario}`);
+    check(q("[data-dsh-status]").textContent===({invalid:"核验失败",valid:"未同步",synced:"已同步"})[scenario],`sidebar_precise_status_${scenario}`);
     if(scenario==="invalid") {
       check(q('[data-dsh-item="yaml"]')?.dataset.state==="fail"&&q('[data-dsh-item="providers"]')?.dataset.state==="unchecked","diagnostics_failed_stage_and_unchecked_dependents");
       check((q('.connection-check-details') as HTMLDetailsElement).open,"diagnostics_failure_details_auto_expand");
@@ -69,6 +70,39 @@ export async function runDesktopRegression() {
       check(q('[data-dsh-stage="directory"]').dataset.state==="unchecked"&&q('[data-dsh-path-hint]').textContent?.includes('尚未保存'),"diagnostics_unsaved_path_no_stale_result");
     }
   }
+  const verified=await api.snapshot();
+  for(const [name,modify,want] of [
+    ["unconfigured",{settings:{...verified.settings,dshProfile:""}},"未配置"],
+    ["unchecked",{dsh:{...verified.dsh,checkedAt:0}},"待核对"],
+    ["stale_path",{dsh:{...verified.dsh,profile:"different-profile"}},"待核对"],
+    ["sync_error",{dsh:{...verified.dsh,configured:false,syncState:"error"}},"核验失败"],
+    ["runtime_error",{dsh:{...verified.dsh,configured:false,profileValid:false,syncState:"",checks:[] as typeof verified.dsh.checks}},"核验失败"],
+    ["pending",{dshRecoveryPending:true},"待恢复"],
+  ] as const)check(dshConnectionLabel({...verified,...modify})===want,`connection_status_${name}`);
+  const recoveryModel=await api.save({...emptyModel(),name:"Synthetic recovery UI",model:"native-mock",baseUrl:verified.testUpstream!});
+  await invoke("smoke_lifecycle",{action:"recovery-offer-stop"});await click('[aria-label="刷新"]');
+  await until(()=>!!q('[data-close-recovery]'));
+  check(q('[data-close-preserve]').textContent==='保留配置，仅停止网关',"stop_failure_offers_explicit_preserve_choice");
+  check((await api.snapshot()).gatewayRunning&&q('[data-dsh-status]').textContent==='核验失败',"failure_is_not_gateway_off");
+  for(const [width,height] of [[960,640],[800,520]]) {
+    await invoke("smoke_resize",{width,height});await until(()=>innerWidth===width&&innerHeight===height);
+    for(const theme of ["light","dark"] as const){
+      await api.settings({...(await api.snapshot()).settings,theme});await click('[aria-label="刷新"]');
+      const dialog=q('dialog[open]'),rect=dialog.getBoundingClientRect();
+      check(rect.width<=innerWidth&&rect.height<=innerHeight&&dialog.scrollWidth<=dialog.clientWidth+1,`recovery_modal_contained_${width}_${theme}`);
+    }
+  }
+  await click('[data-close-cancel]');await until(()=>!q('[data-close-recovery]'));
+  check((await api.snapshot()).gatewayRunning&&!(await api.snapshot()).dshRecoveryPending,"cancel_keeps_gateway_and_no_reminder");
+  for(const action of ["recovery-offer-stop","recovery-offer-exit"]) {
+    await invoke("smoke_lifecycle",{action});await click('[aria-label="刷新"]');await until(()=>!!q('[data-close-recovery]'));
+    if(action.endsWith('exit'))check(q('[data-close-preserve]').textContent==='保留配置并退出',"tray_exit_failure_has_exit_choice");
+    await click('[data-close-preserve]');await until(()=>!q('[data-close-recovery]'));
+    const after=await api.snapshot();check(!after.gatewayRunning&&after.dshRecoveryPending,`confirmed_preserve_stops_and_remembers_${action}`);
+    check(q('[data-dsh-status]').textContent==='待恢复'&&q('[data-dsh-stage="sync"]').textContent?.includes('配置恢复：待处理'),`recovery_pending_visible_${action}`);
+    await invoke("smoke_lifecycle",{action:"recovery-reset"});
+  }
+  await api.remove(recoveryModel);
   await api.settings(initialSettings);await click('[aria-label="刷新"]');
   check((await api.snapshot()).dsh.checkedAt===0&&q('[data-dsh-stage="directory"]').dataset.state==="unchecked","diagnostics_saved_path_reset");
   await invoke("smoke_resize",{width:960,height:640});await until(()=>innerWidth===960&&innerHeight===640);

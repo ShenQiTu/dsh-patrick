@@ -43,3 +43,24 @@
 .settings-log-toggle small {display:block;color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px;}
 .settings-groups .settings-message {margin:0;padding:0 16px 16px;}
 .settings-groups > .settings-foot {padding:12px 16px;}
+
+/* Directory validation, file synchronization and client traffic are independent states. */
+.connection-path-hint { display:block; margin-top:6px; color:var(--muted); font-size:12px; line-height:1.5; overflow-wrap:anywhere; }
+.connection-diagnostics > div { align-items:flex-start; }
+.connection-content .connection-diagnostics > div { padding:8px 0; }
+.connection-diagnostics > div > svg { flex-shrink:0; margin-top:1px; }
+.connection-diagnostics [data-state="unchecked"] > svg { color:var(--muted); }
+.connection-diagnostics [data-state="pass"] > svg { color:var(--green); }
+.connection-diagnostics [data-state="fail"] > svg, .connection-diagnostics [data-state="fail"] b { color:var(--red); }
+.connection-diagnostics b { font-size:13px; }
+.connection-diagnostics small { color:var(--muted); line-height:1.5; margin-top:4px; }
+.connection-check-details { border:1px solid var(--border); border-radius:6px; min-width:0; font-size:12px; }
+.connection-check-details summary { cursor:pointer; padding:10px 12px; overflow-wrap:anywhere; }
+.connection-check-details summary > span { float:right; color:var(--muted); margin-left:8px; }
+.connection-check-details ul { list-style:none; margin:0; padding:0 12px 4px; }
+.connection-check-details li { border-top:1px solid var(--border); padding:8px 0; overflow-wrap:anywhere; }
+.connection-check-details strong { display:flex; justify-content:space-between; gap:12px; font-weight:500; }
+.connection-check-details em { font-style:normal; flex-shrink:0; color:var(--muted); }
+.connection-check-details [data-state="pass"] em { color:var(--green); }
+.connection-check-details [data-state="fail"] em { color:var(--red); }
+.connection-check-details small { display:block; margin-top:4px; line-height:1.5; color:var(--muted); }

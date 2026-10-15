@@ -32,7 +32,7 @@ let preview: Snapshot = {
   gatewayRunning: false,
   gatewayAvailable: false,
   dshConnected: false,
-  dsh: {profile:"",configured:false,modelCount:0,zenCount:0,message:"浏览器预览不读写 DSH 文件",backupDirectory:""},
+  dsh: {profile:"",configured:false,modelCount:0,zenCount:0,message:"浏览器预览不读写 DSH 文件",backupDirectory:"",profileValid:false,checkedAt:0,syncState:"unchecked",checks:[]},
   trayAvailable: false,
   runtime: { lastDshRequest:0, port: 0, activeRequests: 0, calls: [], testResults: {}, historyVersion: 0, historyError: null },
 };

@@ -39,8 +39,39 @@ export async function runDesktopRegression() {
   }
   await click('[data-nav="connection"]');
   check(!!q('input[aria-label="DSH profile 目录"]'),"dsh_profile_setting_visible");
-  check(q('.connection-panel').textContent?.includes("文件写入不代表客户端已加载"),"dsh_configured_not_claimed_as_runtime_loaded");
+  check(!q('[data-scan-dsh]')&&!q('[aria-label="DSH 扫描起点"]'),"manual_profile_no_scan_controls");
+  check((await api.snapshot()).settings.dshProfile==="","new_install_profile_blank_no_guessed_directory");
+  check(await invoke("smoke_lifecycle",{action:"bridge-self-contained"}),"packaged_bridge_own_runtime_parser_sync_exact_restore");
+  check(q('.connection-panel').textContent?.includes("保存路径不代表检查通过"),"dsh_configured_not_claimed_as_runtime_loaded");
   check(Array.from(document.querySelectorAll<HTMLButtonElement>('.connection-buttons button')).filter(b=>["检查状态","重新同步","断开并恢复"].includes(b.textContent||"")).every(b=>b.disabled),"smoke_cannot_touch_formal_dsh");
+  check(q('[data-dsh-stage="directory"]').dataset.state==="unchecked"&&q('[data-dsh-stage="sync"]').dataset.state==="unchecked","diagnostics_initial_not_falsely_green");
+  const initialSettings=(await api.snapshot()).settings;
+  for(const scenario of ["invalid","valid","synced"]) {
+    await invoke("smoke_lifecycle",{action:`diagnostics-${scenario}`});await click('[aria-label="刷新"]');
+    await until(()=>q('[data-dsh-stage="directory"]').dataset.state===(scenario==="invalid"?"fail":"pass"));
+    check(q('[data-dsh-stage="sync"]').dataset.state===(scenario==="synced"?"pass":"unchecked"),`diagnostics_sync_separate_${scenario}`);
+    if(scenario==="invalid") {
+      check(q('[data-dsh-item="yaml"]')?.dataset.state==="fail"&&q('[data-dsh-item="providers"]')?.dataset.state==="unchecked","diagnostics_failed_stage_and_unchecked_dependents");
+      check((q('.connection-check-details') as HTMLDetailsElement).open,"diagnostics_failure_details_auto_expand");
+      check(q('.connection-diagnostics').textContent?.includes('cordis.patch.yml')&&!q('.connection-panel').textContent?.includes('SYNTHETIC_SECRET'),"diagnostics_ui_file_location_no_secret");
+    }
+    check(q('[data-dsh-stage="client"]').textContent?.includes('网关未运行'),`diagnostics_no_client_claim_${scenario}`);
+    for(const [width,height] of [[960,640],[800,520]]) {
+      await invoke("smoke_resize",{width,height});await until(()=>innerWidth===width&&innerHeight===height);
+      for(const theme of ["light","dark"] as const) {
+        await api.settings({...(await api.snapshot()).settings,theme});await click('[aria-label="刷新"]');await until(()=>document.documentElement.dataset.theme===theme);
+        const panel=q('.connection-panel').getBoundingClientRect();
+        check(Array.from(document.querySelectorAll<HTMLElement>('[data-dsh-stage],.connection-check-details')).every(el=>{const b=el.getBoundingClientRect();return b.left>=panel.left&&b.right<=panel.right+1&&el.scrollWidth<=el.clientWidth+1;}),`diagnostics_contained_${scenario}_${width}_${height}_${theme}`);
+      }
+    }
+    if(scenario==="valid") {
+      await input('input[aria-label="DSH profile 目录"]','F:\\unsaved\\profiles\\desktop');
+      check(q('[data-dsh-stage="directory"]').dataset.state==="unchecked"&&q('[data-dsh-path-hint]').textContent?.includes('尚未保存'),"diagnostics_unsaved_path_no_stale_result");
+    }
+  }
+  await api.settings(initialSettings);await click('[aria-label="刷新"]');
+  check((await api.snapshot()).dsh.checkedAt===0&&q('[data-dsh-stage="directory"]').dataset.state==="unchecked","diagnostics_saved_path_reset");
+  await invoke("smoke_resize",{width:960,height:640});await until(()=>innerWidth===960&&innerHeight===640);
   await click('[data-nav="overview"]');
   await until(()=>!!q('[data-usage-calls]'));
   const stats=await api.statistics();
@@ -84,23 +115,37 @@ export async function runDesktopRegression() {
   await invoke("smoke_resize",{width:960,height:640});await until(()=>innerWidth===960 && innerHeight===640);
   await api.settings({...(await api.snapshot()).settings,theme:'light'});await click('[aria-label="刷新"]');
   await click('[data-nav="models"]');
-  const id=await api.save({...emptyModel(),name:"Prompt switch desktop",model:"native-mock",baseUrl:(await api.snapshot()).testUpstream!,prompt:"LOCAL_TEST_PROMPT",promptEnabled:true});
+  const longPrompt="中".repeat(17*1024);
+  const id=await api.save({...emptyModel(),name:"Prompt switch desktop",model:"native-mock",baseUrl:(await api.snapshot()).testUpstream!,prompt:longPrompt,promptEnabled:true});
   await click('[aria-label="刷新"]');
   await until(()=>!!q('[aria-label="编辑 Prompt switch desktop"]'));
   await click('[aria-label="编辑 Prompt switch desktop"]');
+  const textarea=q('textarea[aria-label="注入提示词"]') as HTMLTextAreaElement;
+  check(textarea.maxLength===-1,"prompt_no_mismatched_character_limit");
+  check(q('[data-prompt-size]').textContent?.includes("52224 / 131072"),"prompt_51k_utf8_counter");
+  const setPrompt=async(value:string)=>{
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,"value")!.set!.call(textarea,value);
+    textarea.dispatchEvent(new Event("input",{bubbles:true}));await sleep();
+  };
+  await setPrompt("a".repeat(131073));
+  (q('form.compact-editor') as HTMLFormElement).requestSubmit();await sleep();
+  check(q('[role="alert"]')?.textContent?.includes("注入提示词过长：当前 131073 字节，上限 131072 字节"),"prompt_overlimit_error_identifies_field_and_bytes");
+  check(document.activeElement===textarea,"prompt_error_focuses_field");
+  check((await api.snapshot()).models.find(m=>m.id===id)?.prompt===longPrompt,"prompt_rejected_draft_preserves_saved_text");
+  await setPrompt(longPrompt);
   await click('[aria-label="启用注入提示词"]');
   check(!q('textarea[aria-label="注入提示词"]'),"prompt_disabled_editor_collapses");
   (q('form.compact-editor') as HTMLFormElement).requestSubmit();
   await until(()=>!q('dialog[open]'));
   let m=(await api.snapshot()).models.find(m=>m.id===id)!;
-  check(!m.promptEnabled && m.prompt==="LOCAL_TEST_PROMPT","prompt_disable_saves_flag_preserves_text");
+  check(!m.promptEnabled && m.prompt===longPrompt,"prompt_disable_saves_flag_preserves_text");
   const duplicated=await api.duplicate(id);
   m=(await api.snapshot()).models.find(m=>m.id===duplicated)!;
-  check(!m.promptEnabled && m.prompt==="LOCAL_TEST_PROMPT","prompt_duplicate_preserves_switch");
+  check(!m.promptEnabled && m.prompt===longPrompt,"prompt_duplicate_preserves_switch");
   await click('[aria-label="刷新"]');
   await click('[aria-label="编辑 Prompt switch desktop"]');
   await click('[aria-label="启用注入提示词"]');
-  check((q('textarea[aria-label="注入提示词"]') as HTMLTextAreaElement).value==="LOCAL_TEST_PROMPT","prompt_reenable_restores_text");
+  check((q('textarea[aria-label="注入提示词"]') as HTMLTextAreaElement).value===longPrompt,"prompt_reenable_restores_text");
   (q('form.compact-editor') as HTMLFormElement).requestSubmit();await until(()=>!q('dialog[open]'));
   check((await api.snapshot()).models.find(m=>m.id===id)?.promptEnabled,"prompt_reenable_persisted");
   await api.remove(duplicated); await api.remove(id); await click('[aria-label="刷新"]');

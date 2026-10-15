@@ -46,6 +46,7 @@ const presets = [
     full: false,
   },
 ];
+const MAX_PROMPT_BYTES = 128 * 1024;
 const assetUrls = import.meta.glob<string>("./assets/*", {
   eager: true,
   query: "?url",
@@ -92,6 +93,7 @@ export function ModelEditor({
   const [discoveryNote, setDiscoveryNote] = useState("");
   const modelInput = useRef<HTMLInputElement>(null);
   const busy = saving || discovering;
+  const promptBytes = new TextEncoder().encode(draft.prompt).length;
   function patch(value: Partial<ModelInput>) {
     setDraft((d) => ({ ...d, ...value }));
     setError("");
@@ -102,6 +104,8 @@ export function ModelEditor({
     setDiscoveryNote("");
   }
   function prepared(): ModelInput {
+    if (promptBytes > MAX_PROMPT_BYTES)
+      throw new Error(`注入提示词过长：当前 ${promptBytes} 字节，上限 131072 字节（128 KiB，按 UTF-8 计算）`);
     let parsed: Record<string, unknown> = draft.headers;
     try {
       const candidate = jsonObject(headers, "自定义 Headers");
@@ -136,10 +140,16 @@ export function ModelEditor({
       ? '[aria-label="自定义 Headers JSON"]'
       : message.includes("额外参数")
         ? '[aria-label="额外参数 JSON"]'
-        : null;
+        : message.includes("提示词")
+          ? '[aria-label="注入提示词"]'
+          : message.includes("Key")
+            ? 'input[name="apiKey"]'
+            : message.includes("地址") || message.includes("URL")
+              ? 'input[name="baseUrl"]'
+              : null;
     if (selector)
       requestAnimationFrame(() =>
-        document.querySelector<HTMLTextAreaElement>(selector)?.focus(),
+        document.querySelector<HTMLElement>(selector)?.focus(),
       );
   }
   async function discover() {
@@ -638,11 +648,14 @@ export function ModelEditor({
                     onChange={() => patch({ promptEnabled: !draft.promptEnabled })}
                   />
                 </div>
+                <small className="prompt-size" data-prompt-size aria-live="polite">
+                  {promptBytes} / {MAX_PROMPT_BYTES} 字节（UTF-8，上限 128 KiB）
+                </small>
                 {draft.promptEnabled && (
                   <textarea
                     aria-label="注入提示词"
                     rows={5}
-                    maxLength={32768}
+                    aria-invalid={promptBytes > MAX_PROMPT_BYTES}
                     value={draft.prompt}
                     placeholder="仅对此模型生效；关闭开关并保存后停止注入，已填写内容保留。"
                     onChange={(e) => patch({ prompt: e.target.value })}

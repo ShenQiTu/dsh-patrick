@@ -13,8 +13,7 @@ const zenPath=path.join(source,'packages/llm/llm-zen-session-headers/lib/index.j
 const Zen=await import(pathToFileURL(zenPath).href);
 const require=createRequire(import.meta.url);
 const {generate,yamlTools}=require('../src-tauri/src/dsh_bridge.cjs');
-const anchor=process.env.DSH_PATRICK_YAML_ANCHOR||assert.fail('Set YAML parser anchor');
-const y=yamlTools(path.dirname(anchor));
+const y=yamlTools();
 // Synthetic declarations only, never parse the real DSH configuration here.
 const doc=y.parse('- id: llm-pi-ai\n  config:\n    providers: {}\n- id: llm-zen-session-headers\n  config: {enabled: true, models: [zen-free], providers: []}\n');
 const observed=[];

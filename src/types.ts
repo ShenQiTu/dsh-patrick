@@ -53,7 +53,7 @@ export interface Snapshot {
   gatewayRunning: boolean;
   gatewayAvailable: boolean;
   dshConnected: boolean;
-  dsh: {profile:string; configured:boolean; modelCount:number; zenCount:number; message:string; backupDirectory:string};
+  dsh: {profile:string; configured:boolean; modelCount:number; zenCount:number; message:string; backupDirectory:string;profileValid:boolean;checkedAt:number;syncState:string;checks:{id:string;label:string;state:"pass"|"fail"|"unchecked";detail:string}[]};
   trayAvailable: boolean;
   runtime: {
     lastDshRequest: number;

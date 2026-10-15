@@ -1,12 +1,13 @@
 {
   "name": "dsh-patrick",
-  "version": "0.1.11",
+  "version": "0.1.14",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 1427 --strictPort",
-    "build": "tsc --noEmit && vite build",
-    "tauri": "tauri"
+    "dev": "npm run bridge:build && vite --host 127.0.0.1 --port 1427 --strictPort",
+    "build": "npm run bridge:build && tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "bridge:build": "node tools/build-bridge.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.3",
@@ -18,7 +19,9 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "prettier": "3.6.2",
+    "rolldown": "1.2.13",
     "typescript": "7.0.2",
-    "vite": "8.3.4"
+    "vite": "8.3.4",
+    "yaml": "2.9.0"
   }
 }

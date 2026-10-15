@@ -1,6 +1,6 @@
 # DSH Patrick
 
-面向 DSH 的 Windows 桌面模型网关，使用 Rust、Tauri 2、React、TypeScript 和 Vite 构建。当前版本 **0.1.11**。
+面向 DSH 的 Windows 桌面模型网关，使用 Rust、Tauri 2、React、TypeScript 和 Vite 构建。当前版本 **0.1.14**。
 
 本项目不是 DSH 或 DeepSeek 官方产品。界面布局和部分图标参考 [cursor-byok](https://github.com/leookun/cursor-byok)，不包含其 Cursor 专用接管、证书安装、广告或更新器。
 
@@ -9,7 +9,7 @@
 - 在桌面界面管理多个模型、API 地址、API Key、自定义请求头和额外 JSON 参数。
 - 支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages；按配置协议转发，不做协议互转。
 - 获取上游模型列表、单模型测试、批量测试（最多并发 3）、取消和测试结果详情。
-- 每个模型单独启用注入提示词；新模型默认关闭。推理强度留空时保留客户端设置。
+- 每个模型单独启用注入提示词；新模型默认关闭。提示词上限 128 KiB，按 UTF-8 字节统一计数；错误明确指出字段、实际大小和上限。推理强度留空时保留客户端设置。
 - DSH 自动接入：新增本项目自己的 provider，同步启用模型，不替换原 provider 或强制切换会话默认模型。
 - 断开网关时撤销本项目写入的配置；接入前备份，遇到外部冲突会报错而不是覆盖。
 - Token 趋势、活动热力图、调用记录和按来源筛选的统计。
@@ -20,12 +20,12 @@
 ## 初次使用
 
 1. 启动 Windows 桌面程序，在模型页添加自己的服务器地址、模型 ID 和 Key。仓库不附带可用的账户或个人模型配置。
-2. 在「DSH 接入」中确认自己的 DSH profile 目录（通常为 DSH 数据目录下的 `profiles/web`）。
+2. 在「DSH 接入」中手动填写实际使用的 DSH profile 目录（例如数据目录下的 `profiles/web` 或 `profiles/desktop`），然后保存路径。软件不自动扫描或选择目录；已保存路径原样保留。
 3. 在 DSH 模型页打开网关开关。默认本机地址为 `http://127.0.0.1:8787/v1`，端口可调整。
 4. 回到 DSH，在 **DSH Patrick** provider 下选择模型。上游 Key 只保存在 Patrick；写入 DSH 的是独立本机令牌。
 5. 使用「断开」或托盘退出恢复本项目管理的配置。窗口右上角的 × 只是隐藏窗口。
 
-DSH 接入需要本机标准安装位置的 Node.js，以及目标 profile 已安装的 `yaml` 依赖。可以设置 `DSH_HOME` 辅助查找，但应以接入页确认的路径为准。获取模型列表和点击测试会访问你填写的服务商，并可能产生服务商用量。
+交付包自带 Node.js 接入运行时，YAML 解析器已打包进 Patrick 的接入组件，不从目标 profile 加载依赖或运行 DSH 插件。请完整解压便携包，保留 EXE 旁的 `runtime/node.exe`；用户无需另外安装 Node.js 或给 DSH 补装 YAML。软件仍核对用户指定配置的结构，未知格式保留原文件并报告原因。获取模型列表和点击测试会访问你填写的服务商，并可能产生服务商用量。
 
 ### Zen 请求头
 
@@ -100,15 +100,14 @@ npm run tauri -- dev
 npm run tauri -- build
 ```
 
-未设置 `CARGO_TARGET_DIR` 时，EXE 位于 `src-tauri/target/release/dsh-patrick.exe`。目前关闭安装包生成，发布时仅打包新构建的 EXE 和公开说明，不复制任何 `app-data`。
+未设置 `CARGO_TARGET_DIR` 时，EXE 位于 `src-tauri/target/release/dsh-patrick.exe`。目前关闭安装包生成。发布时先将新 EXE 复制到一个干净目录，再执行 `tools/package-runtime.ps1 -Destination <该目录的绝对路径>` 附带经核验的官方 Node.js v24.15.0 和第三方许可证；发布包包含 EXE、runtime 和公开说明，不复制任何 `app-data`。升级现有目录时保留原数据文件，不创建空配置覆盖它们。
 
 `npm run dev` 单独启动的是浏览器界面预览，不具有真正的桌面网关能力。缓存位置可由 `CARGO_HOME`、`CARGO_TARGET_DIR` 和 `npm_config_cache` 自行指定；公开构建流程不依赖开发者的内部打包脚本或测试报告。
 
 ### 可选 DSH 集成测试
 
-默认 Rust 测试及统计测试使用本机模拟数据，不调用真实上游。DSH 集成测试需要额外依赖，默认标记为忽略：
+默认 Rust 测试及统计测试使用本机模拟数据，不调用真实上游。桥接与多实例恢复测试不再需要目标 profile 的 YAML；实际 DSH 插件协议集成仍需要以下显式环境：
 
-- `DSH_PATRICK_YAML_ANCHOR`：已安装 YAML 依赖的 profile/package.json。
 - `DSH_PATRICK_DSH_SOURCE`：已构建 DSH 源码目录。
 - `DSH_PATRICK_TEST_ROOT`：尚不存在的隔离测试目录，仅用于独立 Node bridge 测试。
 
@@ -153,3 +152,13 @@ cargo test --locked --manifest-path .\src-tauri\Cargo.toml -- --ignored --nocapt
 - 不接入账号切换事件，不自动读取中转站配置、不自动重放请求。换号期间如果中转站完全不发数据并超过兜底，仍会终止；心跳保持链路不等于正文成功。
 - 完成仍须满足协议结束事件，HTTP200、只有心跳、流内错误、缺少结束标记都不当作完整成功。
 - 原timeoutSeconds及现有值保留，仅控制排队及非流式请求总时间；新字段缺失时加载默认600+10，不改模型和鉴权。每个请求使用开始时的配置快照，新设置对新请求生效。
+
+### v0.1.13 接入组件独立化
+
+仅调整解析器与运行时来源，保留原有配置结构校验、备份、锁、归属检查、定点同步和恢复。未加入自动扫描，未改变网关启停与自动接入的绑定关系。前一版的 128 KiB 提示词修复继续保留。
+
+### v0.1.14 接入诊断
+
+手动填写并保存 profile 后，点击“检查状态”会只读检查目录、必要文件、YAML 语法、模型配置、上层覆盖和凭据结构。页面分开显示目录检查、配置同步、客户端入口请求，不把保存路径或写入文件当作客户端已加载。检查失败自动展开明细，指出文件、配置项及处理建议；YAML 语法错误只显示行列，不回显正文或密钥。前置检查失败时，后续项目显示未检查。未保存的新路径不沿用旧结果；保存新路径后清除旧诊断。
+
+检查遵守当前受支持的 profile 结构，不自动扫描或修改 DSH 文件。备份副本可能同样通过结构检查；入口标记不区分具体 profile，实际加载仍需用户在所用 DSH 选择 Patrick 模型并核对请求记录。自带 YAML/Node 的方案及原同步、备份、恢复机制保留。

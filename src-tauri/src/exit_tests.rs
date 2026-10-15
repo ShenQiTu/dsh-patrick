@@ -31,14 +31,10 @@ fn exit_ownership_missing_foreign_owned_and_invalid() {
 }
 
 #[tokio::test]
-#[ignore = "Requires YAML parser anchor; isolated multi-copy exit integration"]
 async fn exit_foreign_profile_does_not_block_or_restore_other_copy() {
-    let anchor=std::env::var("DSH_PATRICK_YAML_ANCHOR").unwrap();
     let root=root();let profile=root.join("profiles/web");
-    std::fs::create_dir_all(profile.join("node_modules/yaml")).unwrap();
+    std::fs::create_dir_all(&profile).unwrap();
     std::fs::write(profile.join("package.json"),"{}").unwrap();
-    let shim=format!("module.exports=require('node:module').createRequire({})('yaml');",serde_json::to_string(&anchor).unwrap());
-    std::fs::write(profile.join("node_modules/yaml/index.js"),shim).unwrap();
     let original="- id: llm-pi-ai\n  config:\n    providers: {}\n";
     std::fs::write(profile.join("cordis.patch.yml"),original).unwrap();
     fn state(directory:PathBuf,profile:&std::path::Path)->AppState {

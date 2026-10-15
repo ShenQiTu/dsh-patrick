@@ -240,12 +240,17 @@ pub fn validate_model(m: &Model) -> Result<(), String> {
     {
         return Err("上游使用 HTTPS；本机测试可用 HTTP。地址中不要包含凭据、查询或片段".into());
     }
-    if m.base_url.len() > 2048
-        || m.api_key.len() > 8192
-        || m.api_key.chars().any(char::is_control)
-        || m.prompt.len() > 32768
-    {
-        return Err("地址、Key 或提示词长度/格式不正确".into());
+    if m.base_url.len() > 2048 {
+        return Err(format!("服务器地址过长：当前 {} 字节，上限 2048 字节（UTF-8）", m.base_url.len()));
+    }
+    if m.api_key.len() > 8192 {
+        return Err(format!("API Key 过长：当前 {} 字节，上限 8192 字节（UTF-8）", m.api_key.len()));
+    }
+    if m.api_key.chars().any(char::is_control) {
+        return Err("API Key 含有控制字符，请移除换行、制表等不可见字符".into());
+    }
+    if m.prompt.len() > 128 * 1024 {
+        return Err(format!("注入提示词过长：当前 {} 字节，上限 131072 字节（128 KiB，按 UTF-8 计算）", m.prompt.len()));
     }
     if m.context_window
         .is_some_and(|n| !(1024..=4_000_000).contains(&n))
@@ -832,5 +837,71 @@ mod tests {
         std::fs::remove_file(path.join("config.dpapi")).unwrap();
         std::fs::remove_file(path.join("instance.lock")).unwrap();
         std::fs::remove_dir(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod prompt_limit_regression {
+    use super::*;
+    fn sample() -> Model {
+        serde_json::from_value(serde_json::json!({
+            "id":"synthetic", "name":"synthetic", "model":"cn:deepseek-v4.1-flash",
+            "protocol":"openai", "baseUrl":"https://example.invalid/v1",
+            "apiKey":"SYNTHETIC_KEY_NOT_A_REAL_KEY", "headers":{}, "enabled":true,
+            "contextWindow":null, "maxOutput":null, "reasoning":"default", "prompt":"",
+            "promptEnabled":false
+        })).unwrap()
+    }
+    #[test]
+    fn utf8_boundaries_and_disabled_prompt() {
+        let mut m=sample();
+        for enabled in [false,true] {
+            m.prompt_enabled=enabled;
+            for text in ["中".repeat(17*1024),"a".repeat(131072),format!("{}aa","中".repeat(43690))] {
+                m.prompt=text;assert!(validate_model(&m).is_ok());
+            }
+            m.prompt.push('a');
+            let e=validate_model(&m).unwrap_err();
+            assert!(e.starts_with("注入提示词过长") && e.contains("131073") && e.contains("131072"));
+            assert!(!e.contains("Key") && !e.contains("地址"));
+        }
+        println!("PROMPT_128K_PASS bytes_52224=ACCEPTED bytes_131072=ACCEPTED bytes_131073=REJECTED utf8=CONSISTENT toggles=BOTH");
+    }
+    #[test]
+    fn address_and_key_limits_unchanged_errors_specific() {
+        let mut m=sample();let prefix="https://example.invalid/";
+        m.base_url=format!("{prefix}{}","a".repeat(2048-prefix.len()));assert!(validate_model(&m).is_ok());
+        m.base_url.push('a');let e=validate_model(&m).unwrap_err();assert!(e.starts_with("服务器地址过长") && e.contains("2049") && e.contains("2048"));
+        m=sample();m.api_key="k".repeat(8192);assert!(validate_model(&m).is_ok());m.api_key.push('k');
+        let e=validate_model(&m).unwrap_err();assert!(e.starts_with("API Key 过长") && e.contains("8193") && e.contains("8192"));
+        for key in ["PRIVATE_SYNTHETIC\nKEY","PRIVATE_SYNTHETIC\rKEY","PRIVATE_SYNTHETIC\tKEY"] {
+            m.api_key=key.into();let e=validate_model(&m).unwrap_err();
+            assert!(e.starts_with("API Key 含有控制字符") && !e.contains("PRIVATE_SYNTHETIC"));
+        }
+        println!("OTHER_FIELDS_PASS url_limit=2048 key_limit=8192 controls=REJECTED errors=FIELD_SPECIFIC secrets=NOT_ECHOED");
+    }
+    #[test]
+    fn prompt_51k_persistence_and_injection_three_protocols() {
+        for protocol in ["openai","responses","anthropic"] {
+            let directory=std::env::temp_dir().join(new_id());
+            let mut store=Store::open(directory.clone()).unwrap();let mut m=sample();
+            m.protocol=protocol.into();m.prompt="中".repeat(17*1024);
+            for enabled in [true,false] {
+                m.prompt_enabled=enabled;
+                let mut value=serde_json::to_value(&m).unwrap();value["id"]=serde_json::Value::Null;
+                if let Some(saved)=store.config.models.first(){value["id"]=serde_json::json!(saved.id);}
+                store.save(serde_json::from_value(value).unwrap()).unwrap();
+                drop(store);store=Store::open(directory.clone()).unwrap();
+                let saved=&store.config.models[0];assert_eq!(saved.prompt,m.prompt);assert_eq!(saved.prompt_enabled,enabled);
+                let body=if protocol=="responses" {serde_json::json!({"input":"synthetic"})}
+                    else {serde_json::json!({"messages":[{"role":"user","content":"synthetic"}]})};
+                let out=crate::protocol::prepare_body(saved,body).unwrap().to_string();
+                assert_eq!(out.contains(&m.prompt),enabled);
+            }
+            drop(store);
+            std::fs::remove_file(directory.join("config.dpapi")).unwrap();
+            std::fs::remove_file(directory.join("instance.lock")).unwrap();std::fs::remove_dir(directory).unwrap();
+        }
+        println!("PROMPT_PERSIST_PASS bytes=52224 protocols=3 encrypted_reopen=EXACT enabled=INJECTED disabled=NOT_INJECTED");
     }
 }

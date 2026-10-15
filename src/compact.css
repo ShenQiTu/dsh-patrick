@@ -516,6 +516,7 @@ main {
   color: var(--muted);
   font-size: 13px;
 }
+.prompt-size { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
 .toggle-json textarea {
   margin-top: 7px;
   font-size: 12px;

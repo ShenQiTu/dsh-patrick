@@ -38,11 +38,12 @@ impl AppState {
         let config=self.store.lock().map_err(|_| "配置锁异常")?.config.clone();
         let port=self.gateway.runtime()?.port;
         let action=action.to_owned();
-        let result=tauri::async_runtime::spawn_blocking(move || dsh::execute(&directory,&config,&action,port)).await.map_err(|_| "DSH 接入任务异常")?;
+        let profile=config.settings.dsh_profile.clone();
+        let result=tauri::async_runtime::spawn_blocking(move || dsh::execute_detailed(&directory,&config,&action,port)).await.unwrap_or_else(|_|Err(dsh::Failure::from("DSH 接入任务异常")));
         let mut status=self.dsh.lock().map_err(|_| "接入状态锁异常")?;
         match result {
             Ok(value)=>{*status=value;Ok(())}
-            Err(error)=>{status.configured=false;status.message=error.clone();Err(error)}
+            Err(error)=>{let message=error.message.clone();*status=dsh::Status::failed(profile,error);Err(message)}
         }
     }
     async fn sync_if_running(&self) -> Result<(), String> {
@@ -55,7 +56,7 @@ impl AppState {
         if !self.smoke {
             let profile=self.store.lock().map_err(|_| "配置锁异常")?.config.settings.dsh_profile.clone();
             if dsh::owns_integration(&self.directory,&profile)? { self.bridge("disconnect").await?; }
-            else { self.dsh.lock().map_err(|_| "接入状态锁异常")?.configured=false; }
+            else { *self.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status {profile,message:"网关已断开；请点击检查状态重新核对配置".into(),..Default::default()}; }
         }
         self.gateway.stop().await
     }
@@ -166,7 +167,11 @@ async fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) ->
     {
         return Err("修改监听端口前请先关闭网关".into());
     }
-    state.gateway.save_settings(settings)
+    let changed_profile=old.dsh_profile!=settings.dsh_profile;
+    let profile=settings.dsh_profile.clone();
+    state.gateway.save_settings(settings)?;
+    if changed_profile {*state.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status {profile,message:"路径已保存，尚未检查；请点击检查状态".into(),..Default::default()};}
+    Ok(())
 }
 
 #[tauri::command]
@@ -301,6 +306,19 @@ async fn smoke_lifecycle(app: tauri::AppHandle, state: tauri::State<'_, AppState
         "show" => { lifecycle::show(&app)?; Ok(true) }
         "visible" => app.get_webview_window("main").ok_or("窗口未就绪")?.is_visible().map_err(|e| e.to_string()),
         "exit-check" => { lifecycle::prepare_exit(&app).await?; Ok(true) }
+        "bridge-self-contained" => {
+            let directory=state.directory.clone();
+            tauri::async_runtime::spawn_blocking(move || dsh::smoke_probe(&directory)).await.map_err(|_| "接入组件自测任务异常")??;
+            Ok(true)
+        }
+        "diagnostics-invalid" | "diagnostics-valid" | "diagnostics-synced" => {
+            let directory=state.directory.clone();let scenario=action.trim_start_matches("diagnostics-").to_owned();
+            let result=tauri::async_runtime::spawn_blocking(move || dsh::smoke_diagnostics(&directory,&scenario)).await.map_err(|_| "诊断自测任务异常")??;
+            let mut settings=state.store.lock().map_err(|_| "配置锁异常")?.config.settings.clone();
+            settings.dsh_profile=result.profile.clone();state.gateway.save_settings(settings)?;
+            *state.dsh.lock().map_err(|_| "接入状态锁异常")?=result;
+            Ok(true)
+        }
         _ => Err("未知测试动作".into()),
     }
 }

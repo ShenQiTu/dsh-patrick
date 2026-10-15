@@ -1,14 +1,9 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
-const {createRequire}=require('node:module');
 const {run,yamlTools}=require('../src-tauri/src/dsh_bridge.cjs');
 const base=path.resolve(process.env.DSH_PATRICK_TEST_ROOT||assert.fail('Set DSH_PATRICK_TEST_ROOT to an isolated directory'));
 assert(!fs.existsSync(base));fs.mkdirSync(base,{recursive:true});
-// Only the parser is reused from the installed profile. No plugin or real configuration is loaded.
-const parser=createRequire(process.env.DSH_PATRICK_YAML_ANCHOR||assert.fail('Set DSH_PATRICK_YAML_ANCHOR')).resolve('yaml');
-fs.mkdirSync(path.join(base,'node_modules/yaml'),{recursive:true});
-fs.writeFileSync(path.join(base,'node_modules/yaml/package.json'),JSON.stringify({main:parser}));
 let checks=0;
 function check(value,name){assert(value,name);checks++;console.log('PASS '+name);}
 const original=`# preserve this comment\n- id: unrelated\n  config:\n    expression: !!js process.env.LOCAL_SAMPLE\n- id: llm-pi-ai\n  config:\n    providers:\n      old:\n        api: openai-completions\n        apiKeyEnv: OLD_KEY\n        baseURL: https://example.invalid/v1\n        models:\n          - id: zen-free\n            input: [text, image]\n            reasoningEfforts: {off: null, high: high}\n- insert:\n    - id: llm-zen-session-headers\n      name: '@deepseek-ai/dsh-llm-zen-session-headers'\n      config:\n        enabled: true\n        providers: []\n        models: [zen-*]\n- id: agent-default-model\n  config: {provider: old, model: untouched}\n`;

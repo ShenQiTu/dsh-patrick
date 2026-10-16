@@ -216,9 +216,18 @@ async fn save_settings(state: tauri::State<'_, AppState>, settings: Settings) ->
     {
         return Err("修改监听端口前请先关闭网关".into());
     }
+    let changed_dsh_wait=old.dsh_stream_idle_seconds!=settings.dsh_stream_idle_seconds;
     let changed_profile=old.dsh_profile!=settings.dsh_profile;
     let profile=settings.dsh_profile.clone();
     state.gateway.save_settings(settings)?;
+    if changed_dsh_wait {
+        if let Err(error)=state.sync_if_running().await {
+            let mut store=state.store.lock().map_err(|_| "配置锁异常")?;
+            let mut restored=store.config.settings.clone();restored.dsh_stream_idle_seconds=old.dsh_stream_idle_seconds;
+            store.settings(restored).map_err(|_| "DSH 同步及本机等待设置恢复失败，请核对接入状态后重试".to_string())?;
+            return Err(format!("DSH 输出等待时间同步失败，已恢复原设置：{error}"));
+        }
+    }
     if changed_profile {*state.dsh.lock().map_err(|_| "接入状态锁异常")?=dsh::Status {profile,message:"路径已保存，尚未检查；请点击检查状态".into(),..Default::default()};}
     Ok(())
 }

@@ -49,6 +49,10 @@ pub struct Model {
     pub extra_params: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    #[serde(default)]
+    pub compaction_percent: Option<f64>,
+    #[serde(default)]
+    pub multimodal: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,6 +86,10 @@ pub struct ModelInput {
     pub extra_params: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub thinking_budget: Option<u32>,
+    #[serde(default)]
+    pub compaction_percent: Option<f64>,
+    #[serde(default)]
+    pub multimodal: Option<bool>,
 }
 
 fn default_prompt_enabled() -> bool { true }
@@ -137,6 +145,8 @@ pub struct Settings {
     pub stream_idle_seconds: u32,
     #[serde(default = "default_stream_grace_seconds")]
     pub stream_grace_seconds: u32,
+    #[serde(default = "default_dsh_stream_idle_seconds")]
+    pub dsh_stream_idle_seconds: u32,
     #[serde(default = "default_max_body_mb")]
     pub max_body_mb: usize,
     #[serde(default = "default_body_concurrency")]
@@ -148,6 +158,7 @@ pub struct Settings {
     #[serde(default)]
     pub detailed_logging: bool,
 }
+fn default_dsh_stream_idle_seconds() -> u32 { 300 }
 fn default_stream_idle_seconds() -> u32 { 600 }
 fn default_stream_grace_seconds() -> u32 { 10 }
 fn default_body_concurrency() -> usize { 16 }
@@ -163,6 +174,7 @@ impl Default for Settings {
             timeout_seconds: 120,
             stream_idle_seconds: default_stream_idle_seconds(),
             stream_grace_seconds: default_stream_grace_seconds(),
+            dsh_stream_idle_seconds: default_dsh_stream_idle_seconds(),
             max_body_mb: default_max_body_mb(),
             body_concurrency: default_body_concurrency(),
             upstream_concurrency: default_upstream_concurrency(),
@@ -177,6 +189,7 @@ impl Settings {
         u64::from(self.stream_idle_seconds) + u64::from(self.stream_grace_seconds)
     }
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=2_147_483).contains(&self.dsh_stream_idle_seconds) { return Err("DSH 模型输出等待时间需为 1–2147483 秒的整数".into()); }
         if self.dsh_profile.len() > 2048 || self.dsh_profile.chars().any(char::is_control) || self.port < 1024
             || !(5..=700).contains(&self.timeout_seconds)
             || !(5..=7200).contains(&self.stream_idle_seconds)
@@ -252,6 +265,7 @@ pub fn validate_model(m: &Model) -> Result<(), String> {
     if m.prompt.len() > 128 * 1024 {
         return Err(format!("注入提示词过长：当前 {} 字节，上限 131072 字节（128 KiB，按 UTF-8 计算）", m.prompt.len()));
     }
+    if m.compaction_percent.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 100.0) { return Err("自动压缩阈值需大于 0 且不超过 100%".into()); }
     if m.context_window
         .is_some_and(|n| !(1024..=4_000_000).contains(&n))
         || m.max_output
@@ -442,6 +456,8 @@ impl Store {
             extra_enabled: input.extra_enabled,
             extra_params: input.extra_params,
             thinking_budget: input.thinking_budget,
+            compaction_percent: input.compaction_percent,
+            multimodal: input.multimodal,
         };
         validate_model(&m)?;
         Ok(m)
@@ -513,6 +529,8 @@ impl Store {
             extra_enabled: m.extra_enabled,
             extra_params: m.extra_params,
             thinking_budget: m.thinking_budget,
+            compaction_percent: m.compaction_percent,
+            multimodal: m.multimodal,
         })
     }
     pub fn pricing(&mut self, pricing: TokenPricing) -> Result<(), String> {
@@ -570,6 +588,33 @@ mod tests {
         std::fs::remove_file(path.join("instance.lock")).unwrap(); std::fs::remove_dir(path).unwrap();
         println!("PRICING_PASS legacy=EMPTY zero=VALID range=VALIDATED persistence=PASS models_keys_token=UNCHANGED invalid_disk=PRESERVED");
     }
+    #[test]
+    fn model_options_and_dsh_wait_migration_persistence() {
+        let mut legacy=serde_json::to_value(sample()).unwrap();
+        legacy.as_object_mut().unwrap().remove("compactionPercent");
+        legacy.as_object_mut().unwrap().remove("multimodal");
+        let old:Model=serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.compaction_percent,None);assert_eq!(old.multimodal,None);
+        let mut settings=serde_json::to_value(Settings::default()).unwrap();
+        settings.as_object_mut().unwrap().remove("dshStreamIdleSeconds");
+        let migrated:Settings=serde_json::from_value(settings).unwrap();assert_eq!(migrated.dsh_stream_idle_seconds,300);
+        for n in [0,2_147_484] {assert!(Settings {dsh_stream_idle_seconds:n,..Settings::default()}.validate().is_err());}
+        for n in [1,300,900,2_147_483] {assert!(Settings {dsh_stream_idle_seconds:n,..Settings::default()}.validate().is_ok());}
+        let path=std::env::temp_dir().join(new_id());let mut store=Store::open(path.clone()).unwrap();
+        let mut m=sample();m.compaction_percent=Some(85.0);m.multimodal=Some(true);
+        let mut v=serde_json::to_value(&m).unwrap();v["id"]=serde_json::Value::Null;
+        let id=store.save(serde_json::from_value(v).unwrap()).unwrap();
+        let copy=store.duplicate(&id).unwrap();
+        assert!(store.config.models.iter().find(|m|m.id==copy).unwrap().multimodal.unwrap());
+        assert_eq!(store.config.models.iter().find(|m|m.id==copy).unwrap().compaction_percent,Some(85.0));
+        store.settings(Settings {dsh_stream_idle_seconds:900,..Settings::default()}).unwrap();drop(store);
+        let store=Store::open(path.clone()).unwrap();assert_eq!(store.config.settings.dsh_stream_idle_seconds,900);
+        assert!(store.config.models.iter().all(|m|m.compaction_percent==Some(85.0)&&m.multimodal==Some(true)));drop(store);
+        for n in [0.0,-1.0,100.1,f64::NAN,f64::INFINITY] {m.compaction_percent=Some(n);assert!(validate_model(&m).is_err());}
+        for n in [0.001,85.0,90.0,100.0] {m.compaction_percent=Some(n);assert!(validate_model(&m).is_ok());}
+        std::fs::remove_file(path.join("config.dpapi")).unwrap();std::fs::remove_file(path.join("instance.lock")).unwrap();std::fs::remove_dir(path).unwrap();
+        println!("MODEL_CONFIG_PASS legacy=PRESERVED default_wait=300 percent=85 persistence=ENCRYPTED duplicate=PRESERVED validation=PASS");
+    }
     fn sample() -> Model {
         Model {
             id: "test".into(),
@@ -592,6 +637,8 @@ mod tests {
             extra_enabled: false,
             extra_params: BTreeMap::new(),
             thinking_budget: None,
+            compaction_percent: None,
+            multimodal: None,
         }
     }
     #[test]
@@ -821,6 +868,8 @@ mod tests {
                 extra_enabled: false,
                 extra_params: BTreeMap::new(),
                 thinking_budget: None,
+            compaction_percent: None,
+            multimodal: None,
             })
             .unwrap();
         assert!(Store::open(path.clone()).is_err());

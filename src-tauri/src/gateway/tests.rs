@@ -329,6 +329,12 @@ async fn mock_upstream(State(state): State<Mock>, request: Request) -> Response 
         .into_response();
     }
     let model = value.get("model").and_then(Value::as_str).unwrap_or("");
+    if model == "budget-reasoning-test" {
+        let budget=value["max_completion_tokens"].as_u64().unwrap();
+        let enough=budget>=1024;
+        let event=json!({"choices":[{"delta":if enough {json!({"content":"SYNTHETIC_OK"})} else {json!({"reasoning_content":"SYNTHETIC_REASONING"})},"finish_reason":if enough {"stop"} else {"length"}}],"usage":{"completion_tokens":if enough {1030} else {512},"completion_tokens_details":{"reasoning_tokens":if enough {1024} else {512}}}});
+        return ([("content-type","text/event-stream")],format!("data: {event}\n\ndata: [DONE]\n\n")).into_response();
+    }
     if let Some(response) = idle_mock(model, parts.uri.path()) { return response; }
     if model == "retry-once" && state.seen.lock().unwrap().iter().filter(|r| r.body["model"] == "retry-once").count() == 1 {
         return (StatusCode::SERVICE_UNAVAILABLE, "synthetic transient failure").into_response();
@@ -604,6 +610,8 @@ impl Fixture {
             extra_enabled: false,
             extra_params: BTreeMap::new(),
             thinking_budget: None,
+            compaction_percent: None,
+            multimodal: None,
         };
         store.lock().unwrap().save(input).unwrap();
         let engine = Gateway::new(store).unwrap();
@@ -1661,4 +1669,87 @@ fn zen_compat_structured_protocol_results() {
         let mut metrics=Metrics::new(true);metrics.feed(body.as_bytes(),1);metrics.finish(2);assert_eq!(metrics.zen_success(),success);
     }
     println!("ZEN_STRUCTURED_PASS null_error=SUCCESS partial_failed=ERROR nonstream_max_tokens=ERROR reasoning_and_tools=SUCCESS");
+}
+
+#[tokio::test]
+async fn zen_test_budget_on_wire_and_normal_forwarding_unchanged() {
+    // The environment override is used only to verify restored old behavior.
+    let expected: u64 = std::env::var("DSH_PATRICK_EXPECT_TEST_BUDGET")
+        .ok().map(|v| v.parse().unwrap()).unwrap_or(20_000);
+    for (kind,key) in [("openai","max_completion_tokens"),("responses","max_output_tokens"),("anthropic","max_tokens")] {
+        let f=Fixture::new(kind).await;
+        let mut m=f.engine.config().unwrap().models[0].clone();
+        m.zen_test_enabled=true;m.max_output=Some(34_000);
+        m.reasoning=if kind=="anthropic" {"high"} else {"max"}.into();
+        m.prompt="SYNTHETIC_INJECTION_".repeat(860);m.prompt_enabled=true;
+        if kind=="openai" {m.model="budget-reasoning-test".into();}
+        f.engine.save_model(serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap()).unwrap();
+        let r=f.engine.test(&f.id()).await.unwrap();
+        let seen=f.mock.seen.lock().unwrap().last().unwrap().clone();
+        println!("ZEN_TEST_BUDGET_OBSERVED protocol={kind} max_tokens={} http={} state={} finish={:?}",seen.body[key],r.status,r.state,r.info.finish_reason);
+        assert_eq!(seen.body[key],expected,"Zen test budget must match the user's 20,000-token setting");
+        assert_eq!(r.status,200);
+        assert_eq!(r.state,if kind=="openai" && expected==512 {"error"} else {"success"});
+        if kind=="openai" && expected==512 {assert!(r.message.contains("length"));assert_eq!(r.info.reasoning_tokens,Some(512));}
+        assert_eq!(seen.body["stream"],true);
+        assert!(r.zen_header_sent.unwrap());
+        if kind=="anthropic" {assert_eq!(seen.headers["x-api-key"],"UNIT_TEST_UPSTREAM_KEY");}
+        else {assert_eq!(seen.headers["authorization"],"Bearer UNIT_TEST_UPSTREAM_KEY");}
+        let session=seen.headers["x-opencode-session"].to_str().unwrap();
+        assert!(protocol::valid_zen_session(session));
+        assert_eq!(seen.headers["x-opencode-session-id"],session);
+        assert_eq!(seen.body.to_string().matches(&m.prompt).count(),1);
+        match kind {
+            "openai"=>assert_eq!(seen.body["reasoning_effort"],"max"),
+            "responses"=>assert_eq!(seen.body["reasoning"]["effort"],"max"),
+            _=>assert_eq!(seen.body["output_config"]["effort"],"high"),
+        }
+        assert_eq!(f.engine.config().unwrap().models[0].max_output,Some(34_000));
+        // Disabled Zen tests retain the existing 512 budget and do not synthesize headers.
+        m.zen_test_enabled=false;m.model="mock-model".into();
+        f.engine.save_model(serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap()).unwrap();
+        assert_eq!(f.engine.test(&f.id()).await.unwrap().state,"success");
+        let nonzen=f.mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(nonzen.body[key],512);assert!(!nonzen.headers.contains_key("x-opencode-session"));
+        // A normal DSH request is not built with test_body, even with the Zen test switch on.
+        m.zen_test_enabled=true;
+        f.engine.save_model(serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap()).unwrap();
+        let port=f.engine.start_at(0).await.unwrap();
+        let mut body=if kind=="responses" {json!({"input":"SYNTHETIC_PROXY","stream":true})} else {json!({"messages":[{"role":"user","content":"SYNTHETIC_PROXY"}],"stream":true})};
+        body["model"]=json!(f.id());body[key]=json!(4096);
+        let dsh_session="ses_123456789abc0123456789ABCD";
+        let response=reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/{}",protocol::endpoint(kind)))
+            .bearer_auth(f.token()).header("x-opencode-session",dsh_session).json(&body).send().await.unwrap();
+        assert_eq!(response.status(),200);response.text().await.unwrap();
+        let forwarded=f.mock.seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(forwarded.body[key],4096);assert_eq!(forwarded.headers["x-opencode-session"],dsh_session);
+        f.cleanup().await;
+    }
+    println!("ZEN_TEST_BUDGET_PASS expected={expected} protocols=3 injected_prompt=PRESERVED reasoning=PRESERVED zen_headers=PRESERVED non_zen=512 proxy=4096");
+}
+
+#[tokio::test]
+async fn zen_test_budget_optional_output_and_anthropic_thinking() {
+    let f=Fixture::new("openai").await;
+    let mut m=f.engine.config().unwrap().models[0].clone();m.zen_test_enabled=true;
+    for (kind,key) in [("openai","max_completion_tokens"),("responses","max_output_tokens"),("anthropic","max_tokens")] {
+        m.protocol=kind.into();
+        for max in [None,Some(34_000)] {
+            m.max_output=max;
+            assert_eq!(protocol::prepare_body(&m,protocol::test_body(&m)).unwrap()[key],20_000);
+        }
+    }
+    m.protocol="anthropic".into();m.max_output=Some(34_000);
+    for budget in [1024,19_000] {
+        m.thinking_budget=Some(budget);
+        let body=protocol::prepare_body(&m,protocol::test_body(&m)).unwrap();
+        assert_eq!(body["max_tokens"],20_000);assert_eq!(body["thinking"]["budget_tokens"],budget);
+    }
+    m.thinking_budget=Some(20_000);
+    assert!(protocol::prepare_body(&m,protocol::test_body(&m)).is_err());
+    // Preserve explicit advanced parameter behavior; do not change prepare_body globally.
+    m.protocol="openai".into();m.thinking_budget=None;m.extra_enabled=true;
+    m.extra_params.insert("max_completion_tokens".into(),json!(25000));
+    assert_eq!(protocol::prepare_body(&m,protocol::test_body(&m)).unwrap()["max_completion_tokens"],25000);
+    f.cleanup().await;
 }

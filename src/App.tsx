@@ -1,3 +1,4 @@
+import {SettingsCards} from "./SettingsCards";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, native } from "./api";
 import { ModelEditor } from "./ModelEditor";
@@ -590,7 +591,7 @@ export function App() {
               onRefresh={refresh}
               snapshot={state}
               onSave={(settings) =>
-                action(() => api.settings(settings), "设置已保存")
+                (async()=>{ await api.settings(settings); await refresh(); setNotice("设置已保存"); })()
               }
             />
           )}
@@ -702,6 +703,7 @@ export function App() {
       {editor !== undefined && (
         <ModelEditor
           model={editor}
+            inheritedVision={editor ? state?.dsh.modelVision?.[editor.id] : undefined}
           onTest={(id) => void testModels([id])}
           onClose={() => setEditor(undefined)}
           onSaved={async () => {
@@ -757,157 +759,9 @@ function SettingsPage({
   onSave: (s: Settings) => Promise<void>;
   onRefresh: () => Promise<void>;
 }) {
-  const [draft, setDraft] = useState(snapshot.settings),
-    [saving, setSaving] = useState(false);
-  useEffect(
-    () => setDraft(snapshot.settings),
-    [
-      snapshot.settings.port,
-      snapshot.settings.timeoutSeconds,
-      snapshot.settings.streamIdleSeconds,
-      snapshot.settings.streamGraceSeconds,
-      snapshot.settings.maxBodyMb,
-      snapshot.settings.bodyConcurrency,
-      snapshot.settings.upstreamConcurrency,
-      snapshot.settings.logLimit,
-      snapshot.settings.detailedLogging,
-      snapshot.settings.theme,
-    ],
-  );
   return (
     <div className="settings-page">
-    <form className="settings-groups"
-      onSubmit={async (e) => {
-        e.preventDefault();
-        setSaving(true);
-        try {
-          await onSave({...draft,dshProfile:snapshot.settings.dshProfile});
-        } finally {
-          setSaving(false);
-        }
-      }}
-    >
-      <section className="panel settings-panel settings-extra" data-settings-group="gateway">
-        <div className="panel-title"><h3>网关设置</h3></div>
-        <div className="form-grid">
-          <Field label="监听端口" hint="默认 8787；修改端口前请先关闭网关">
-            <input
-              type="number"
-              min={1024}
-              max={65535}
-              required
-              value={draft.port}
-              onChange={(e) =>
-                setDraft({ ...draft, port: Number(e.target.value) })
-              }
-            />
-          </Field>
-          <Field label="排队 / 非流式超时（秒）" hint="5–700 秒；不限制流式回答的累计时长">
-            <input
-              type="number"
-              name="timeoutSeconds"
-              min={5}
-              max={700}
-              required
-              value={draft.timeoutSeconds}
-              onChange={(e) =>
-                setDraft({ ...draft, timeoutSeconds: Number(e.target.value) })
-              }
-            />
-          </Field>
-          <Field
-            label="请求体上限（MiB）"
-            hint="默认 64；1–128 MiB，适用于长上下文和图片输入"
-          >
-            <input
-              name="maxBodyMb"
-              type="number"
-              min={1}
-              max={128}
-              required
-              value={draft.maxBodyMb}
-              onChange={(e) =>
-                setDraft({ ...draft, maxBodyMb: Number(e.target.value) })
-              }
-            />
-          </Field>
-        </div>
-        <p className="settings-message">仅监听本机回环地址；修改端口前请先关闭网关。</p>
-      </section>
-      <section className="panel settings-panel settings-extra" data-settings-group="stream-timeout">
-        <div className="panel-title"><h3>流式超时 · 中转站优先</h3></div>
-        <div className="form-grid">
-          <Field label="无数据兜底基准（秒）" hint="5–7200 秒，默认 600；按中转站实际等待策略设置，不自动读取服务器配置">
-            <input name="streamIdleSeconds" type="number" min={5} max={7200} step={1} required
-              value={draft.streamIdleSeconds}
-              onChange={(e) => setDraft({ ...draft, streamIdleSeconds: Number(e.target.value) })} />
-          </Field>
-          <Field label="额外宽限（秒）" hint="1–60 秒，默认 10；在基准之后额外等待">
-            <input name="streamGraceSeconds" type="number" min={1} max={60} step={1} required
-              value={draft.streamGraceSeconds}
-              onChange={(e) => setDraft({ ...draft, streamGraceSeconds: Number(e.target.value) })} />
-          </Field>
-        </div>
-        <p className="settings-message" data-stream-wait>当前兜底：{draft.streamIdleSeconds + draft.streamGraceSeconds} 秒（基准 + 宽限）。等待响应头、连续无响应数据分别计时；收到数据或心跳后重新计时，不限制持续输出的累计时长。</p>
-        <p className="settings-message">中转站负责换号重试；本网关不检测换号、不自动重发。若换号期间完全无数据且超过兜底，仍会结束等待。新设置用于新请求，进行中的请求沿用开始时的设置。</p>
-      </section>
-      <section className="panel settings-panel settings-extra" data-settings-group="concurrency">
-        <div className="panel-title"><h3>并发与排队</h3></div>
-        <div className="form-grid">
-          <Field label="请求体处理并发数" hint="1–16，默认 16；满额后排队。长上下文或图片较多时可调低以减少内存占用。网关空闲时可保存生效。">
-            <input name="bodyConcurrency" type="number" min={1} max={16} step={1} required
-              value={draft.bodyConcurrency}
-              onChange={(e) => setDraft({ ...draft, bodyConcurrency: Number(e.target.value) })} />
-          </Field>
-          <Field label="模型转发并发数" hint="1–32，默认 32；所有模型及测试共享，满额后排队。网关空闲时可保存生效。">
-            <input name="upstreamConcurrency" type="number" min={1} max={32} step={1} required
-              value={draft.upstreamConcurrency}
-              onChange={(e) => setDraft({ ...draft, upstreamConcurrency: Number(e.target.value) })} />
-          </Field>
-        </div>
-        <p className="settings-message">满额后排队；每阶段最多等待 128 个请求，排队总预算沿用“排队 / 非流式超时”。队列满或等待超时会返回错误；并发数在网关空闲时保存生效。</p>
-      </section>
-      <section className="panel settings-panel settings-extra" data-settings-group="appearance">
-        <div className="panel-title"><h3>外观设置</h3></div>
-        <div className="form-grid">
-          <Field label="界面主题">
-            <Select
-              label="界面主题"
-              value={draft.theme}
-              disabled={saving}
-              onChange={(v) =>
-                setDraft({ ...draft, theme: v as Settings["theme"] })
-              }
-              options={[
-                { value: "light", label: "浅色" },
-                { value: "dark", label: "深色" },
-                { value: "system", label: "跟随系统" },
-              ]}
-            />
-          </Field>
-        </div>
-      </section>
-      <section className="panel settings-panel settings-extra" data-settings-group="calls">
-        <div className="panel-title"><h3>调用记录</h3></div>
-        <div className="form-grid">
-          <Field label="调用记录上限" hint="保存最近 10–1000 条调用；超出上限自动移除旧调用及其详情，首页统计独立保留">
-            <input
-              type="number"
-              min={10}
-              max={1000}
-              required
-              value={draft.logLimit}
-              onChange={(e) =>
-                setDraft({ ...draft, logLimit: Number(e.target.value) })
-              }
-            />
-          </Field>
-          <div className="settings-log-toggle"><div><b>详细记录</b><small>开启后保存之后调用的脱敏请求与响应，可能包含对话正文；关闭仅保留调用信息。请求与响应分别最多 128 KiB，超出部分明确标注。</small></div><Switch label="详细记录" checked={draft.detailedLogging} disabled={saving} onChange={() => setDraft({...draft,detailedLogging:!draft.detailedLogging})}/></div>
-        </div>
-        <p className="settings-message">调用信息本机加密保存，重启后保留。只采集实际存在的指标；旧记录缺失的字段显示“—”。</p>
-      </section>
-      <footer className="settings-foot panel"><span>保存以上四组设置；不会重启 DSH</span><button className="primary" type="submit" disabled={saving}>{saving ? "保存中…" : "保存设置"}</button></footer>
-    </form>
+      <SettingsCards settings={snapshot.settings} onSave={onSave}/>
       <PricingSettings pricing={snapshot.pricing} onRefresh={onRefresh} />
       <ApplicationSettings version={snapshot.appVersion} />
       <StorageSettings snapshot={snapshot} onRefresh={onRefresh} />

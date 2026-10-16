@@ -65,17 +65,19 @@ function jsonObject(text: string, label: string): Record<string, unknown> {
 }
 export function ModelEditor({
   model,
+  inheritedVision,
   onClose,
   onSaved,
   onTest,
 }: {
   model: Model | null;
+  inheritedVision?: boolean;
   onClose: () => void;
   onSaved: () => Promise<void>;
   onTest: (id: string) => void;
 }) {
   const [draft, setDraft] = useState<ModelInput>(
-    model ? { ...model, apiKey: null } : emptyModel(),
+    model ? { ...model, compactionPercent: model.compactionPercent ?? 85, apiKey: null } : emptyModel(),
   );
   const [headers, setHeaders] = useState(
     JSON.stringify(model?.headers ?? {}, null, 2),
@@ -104,6 +106,7 @@ export function ModelEditor({
     setDiscoveryNote("");
   }
   function prepared(): ModelInput {
+    if (draft.compactionPercent===null || !Number.isFinite(draft.compactionPercent) || draft.compactionPercent<=0 || draft.compactionPercent>100) throw new Error("自动压缩阈值需大于 0 且不超过 100%");
     if (promptBytes > MAX_PROMPT_BYTES)
       throw new Error(`注入提示词过长：当前 ${promptBytes} 字节，上限 131072 字节（128 KiB，按 UTF-8 计算）`);
     let parsed: Record<string, unknown> = draft.headers;
@@ -548,6 +551,11 @@ export function ModelEditor({
                     }))}
                 />
               </Field>
+              <Field label="自动压缩阈值（%）">
+                <input name="compactionPercent" type="number" min={0} max={100} step="any" required
+                  value={draft.compactionPercent ?? ""}
+                  onChange={e => patch({compactionPercent: e.target.value === "" ? null : Number(e.target.value)})} />
+              </Field>
               {draft.protocol === "anthropic" && (
                 <Field
                   label="思考预算 Token"
@@ -570,6 +578,12 @@ export function ModelEditor({
                   />
                 </Field>
               )}
+              <div className="full toggle-json">
+                <div><span>多模态（识图） <Help text="声明模型支持图片输入，接入时同步到 DSH。" /></span>
+                <Switch label="多模态（识图）" checked={draft.multimodal ?? inheritedVision ?? false}
+                  disabled={busy} onChange={() => patch({multimodal: !(draft.multimodal ?? inheritedVision ?? false)})} />
+                </div>
+              </div>
               <div className="full toggle-json">
                 <div>
                   <span>

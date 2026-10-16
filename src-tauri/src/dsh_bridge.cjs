@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const YAML = require('yaml');
+const compaction = require('./dsh_compaction.cjs');
 const { execFileSync } = require('node:child_process');
 const { isDeepStrictEqual: equal } = require('node:util');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
@@ -111,6 +112,8 @@ function scopedZen(config,provider,model) {
 }
 function ownedZenRoutes(journal) {return journal.zenRoutes??[];}
 function generate(y,doc,input,ref) {
+  const wait=input.dshStreamIdleSeconds??300;
+  if(!Number.isInteger(wait)||wait<1||wait>2147483)fail('DSH 模型输出等待时间需为 1–2147483 秒的整数');
   const existing=plain(y.providers(doc)); const managed={};const zenIds=[];const zenRoutes=[];let zenAmbiguous=0;
   const zenRow=y.row(doc,'llm-zen-session-headers');const {config:zen,legacy}=zenPolicy(zenRow);
   const api={openai:'openai-completions',responses:'openai-responses',anthropic:'anthropic-messages'};
@@ -124,10 +127,11 @@ function generate(y,doc,input,ref) {
       for(const key of ['input','reasoningEfforts','compat'])if(definition.m[key]!==undefined)local[key]=definition.m[key];
       for(const key of ['contextWindow','maxTokens'])if(definition.m[key]!==undefined)local[key]=definition.m[key];
     }
+    if(model.multimodal!=null) {if(typeof model.multimodal!=='boolean')fail('多模态开关值无效');local.input=model.multimodal?['text','image']:['text'];}
     if(model.contextWindow!=null)local.contextWindow=model.contextWindow;
     if(model.maxOutput!=null)local.maxTokens=model.maxOutput;
     const route='dsh-patrick-'+model.protocol;
-    managed[route]??={displayName:'DSH Patrick · '+model.protocol,api:api[model.protocol],baseURL:`http://127.0.0.1:${input.port}`+(model.protocol==='anthropic'?'':'/v1'),apiKeyEnv:ref,headers:{'x-dsh-patrick':'1'},models:[]};
+    managed[route]??={displayName:'DSH Patrick · '+model.protocol,api:api[model.protocol],baseURL:`http://127.0.0.1:${input.port}`+(model.protocol==='anthropic'?'':'/v1'),apiKeyEnv:ref,streamIdleTimeoutMs:wait*1000,headers:{'x-dsh-patrick':'1'},models:[]};
     managed[route].models.push(local);
     if(zenRow && zenRow.get('disabled')!==true && zen.enabled!==false) {
       if(legacy) {
@@ -157,6 +161,7 @@ function removeOwned(y,current,journal) {
         if(p.has(name) && !equal(plain(p.get(name)),plain(ep.get(name))) && !equal(plain(p.get(name)),plain(prior)))fail('Patrick 模型入口被外部修改，已保留现场；请核对后重试恢复');
         p.delete(name);
       }
+      compaction.remove(y,doc,journal);
       const row=y.row(doc,'llm-zen-session-headers');
       if(ownedZenRoutes(journal).length) {
         const list=row?.getIn(['config','routes']);
@@ -261,6 +266,7 @@ async function runChecked(input,diagnostics) {
       const overlayFile=path.join(home,'cordis.patch.yml');ordinary(overlayFile);
       if(optionalFile(overlayFile,'DSH_HOME/cordis.patch.yml')) {
         const overlay=y.parse(readChecked(overlayFile,'DSH_HOME/cordis.patch.yml'),'DSH_HOME/cordis.patch.yml');
+        if((input.models??[]).some(m=>m.compactionPercent!=null)&&['preset-standard','preset-ptc','preset-cordis'].some(id=>y.row(overlay,id)))fail('DSH_HOME overlay 覆盖压缩预设配置；请先核对实际配置层级');
         if(y.row(overlay,'llm-pi-ai')||y.row(overlay,'llm-zen-session-headers'))fail('DSH_HOME/cordis.patch.yml 的 overlay 覆盖模型或 Zen 配置；请先核对实际接入层级，原文件已保留');
       }
     },'未发现上层模型或 Zen 配置覆盖冲突');
@@ -273,6 +279,8 @@ async function runChecked(input,diagnostics) {
       }
     },'凭据结构检查通过；不显示凭据内容');
     if(!credentialsPresent)diagnostics.checks.find(c=>c.id==='credentials').detail='凭据文件尚不存在；同步时按原流程创建，本次检查未写入';
+    const generated=generate(y,doc,{...input,models:input.models??[]},'DSH_PATRICK_LOCAL_TOKEN');
+    diagnostics.modelVision=Object.fromEntries(Object.values(generated.providers).flatMap(p=>p.models.map(m=>[m.id,(m.input??[]).includes('image')])));
     diagnostics.profileValid=true;
     ordinary(directory);ordinary(stateFile);
     diagnostics.backupDirectory=exists(directory)?directory:'';
@@ -290,8 +298,8 @@ async function runChecked(input,diagnostics) {
     const d=y.parse(current.profile), c=y.parse(current.credentials), e=y.parse(j.after.profile);
     const rules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','models']))??[];
     const scopedRules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','routes']))??[];
-    const configured=ownedZenRoutes(j).every(rule=>scopedRules.some(r=>equal(r,rule))) && j.routes.every(r=>equal(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
-    return {...status,configured,modelCount:j.modelCount,zenCount:j.zenIds.length+ownedZenRoutes(j).reduce((n,r)=>n+r.models.length,0),message:configured?'配置已同步；DSH 是否加载以客户端模型列表及请求记录为准'+(j.zenAmbiguous?`；${j.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''):'配置已变化，请重新同步',backupDirectory:directory};
+    const configured=compaction.present(y,d,j) && ownedZenRoutes(j).every(rule=>scopedRules.some(r=>equal(r,rule))) && j.routes.every(r=>equal(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
+    return {...status,configured,modelCount:j.modelCount,zenCount:j.zenIds.length+ownedZenRoutes(j).reduce((n,r)=>n+r.models.length,0),message:configured?(j.compactionWarning?j.compactionWarning+'；':'')+'配置已同步；DSH 是否加载以客户端模型列表及请求记录为准'+(j.zenAmbiguous?`；${j.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''):'配置已变化，请重新同步',backupDirectory:directory};
   }
   privateDirectory(directory);
   return lock(path.join(profile,'package.json'),()=>lock(credentials,async()=>{
@@ -330,8 +338,9 @@ async function runChecked(input,diagnostics) {
       if(!row.hasIn(['config','routes']))row.setIn(['config','routes'],doc.createNode([]));
       for(const rule of generated.zenRoutes)row.getIn(['config','routes']).add(doc.createNode(rule));
     }
+    const compact=compaction.apply(y,doc,input.models);
     const after={profile:String(doc),credentials:String(c)};
-    const journal={version:1,phase:'pending',owner:input.owner,pid:input.pid,ref,credentialsExisted:old?.credentialsExisted??exists(credentials),routes:[...new Set([...Object.keys(generated.providers),...(old?.routes??[])])],zenIds:[...new Set([...generated.zenIds,...(old?.zenIds??[])])],zenRoutes:[...generated.zenRoutes,...(old?.zenRoutes??[])].filter((r,i,a)=>a.findIndex(v=>equal(v,r))===i),zenAmbiguous:generated.zenAmbiguous,modelCount:input.models.length,before:base,after};
+    const journal={version:1,compaction:compaction.merge(compact.owned,old?.compaction),compactionWarning:compact.warning,compactionExpected:compact.expected,phase:'pending',owner:input.owner,pid:input.pid,ref,credentialsExisted:old?.credentialsExisted??exists(credentials),routes:[...new Set([...Object.keys(generated.providers),...(old?.routes??[])])],zenIds:[...new Set([...generated.zenIds,...(old?.zenIds??[])])],zenRoutes:[...generated.zenRoutes,...(old?.zenRoutes??[])].filter((r,i,a)=>a.findIndex(v=>equal(v,r))===i),zenAmbiguous:generated.zenAmbiguous,modelCount:input.models.length,before:base,after};
     if(!old) {
       const backup=path.join(directory,'backup-'+Date.now()+'-'+crypto.randomBytes(4).toString('hex'));fs.mkdirSync(backup,{mode:0o700});
       fs.writeFileSync(path.join(backup,'cordis.patch.yml'),base.profile,{flag:'wx',mode:0o600});
@@ -344,7 +353,7 @@ async function runChecked(input,diagnostics) {
     try {
       if(read(file)!==beforeRead.profile || (exists(credentials)?read(credentials):'version: 1\nrefs: {}\n')!==beforeRead.credentials)fail('DSH 文件在同步期间发生变化，请重试');
       await atomic(credentials,after.credentials,directory);await atomic(file,after.profile,directory);
-      journal.phase='active';journal.routes=Object.keys(generated.providers);journal.zenIds=generated.zenIds;journal.zenRoutes=generated.zenRoutes;delete journal.previous;
+      journal.compaction=compact.owned;journal.phase='active';journal.routes=Object.keys(generated.providers);journal.zenIds=generated.zenIds;journal.zenRoutes=generated.zenRoutes;delete journal.previous;
       await atomic(stateFile,JSON.stringify(journal),directory);
     } catch(e) {
       // Roll back only bytes still owned by this transaction, never an intervening edit.
@@ -356,7 +365,7 @@ async function runChecked(input,diagnostics) {
       }
       throw e;
     }
-    return {...status,configured:true,modelCount:input.models.length,zenCount:generated.zenIds.length+generated.zenRoutes.reduce((n,r)=>n+r.models.length,0),message:'配置已同步；请在 DSH 选择 DSH Patrick 下的模型'+(generated.zenAmbiguous?`；${generated.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''),backupDirectory:directory};
+    return {...status,configured:true,modelCount:input.models.length,zenCount:generated.zenIds.length+generated.zenRoutes.reduce((n,r)=>n+r.models.length,0),message:(compact.warning?compact.warning+'；':'')+'配置已同步；请在 DSH 选择 DSH Patrick 下的模型'+(generated.zenAmbiguous?`；${generated.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''),backupDirectory:directory};
   }));
 }
 module.exports={run,generate,yamlTools,removeOwned,hash};

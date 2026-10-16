@@ -11,9 +11,12 @@ export function PricingSettings({ pricing, onRefresh }: { pricing: TokenPricing;
   const [editing, setEditing] = useState(false), [saving, setSaving] = useState(false);
   const [draft, setDraft] = useState(toDraft(pricing)), [error, setError] = useState("");
   return <section className="panel settings-extra pricing-settings">
-    <div className="panel-title"><h3>Token 定价</h3>{!editing && <button className="text-button" data-edit-pricing onClick={() => { setDraft(toDraft(pricing)); setError(""); setEditing(true); }}>编辑</button>}</div>
+    <div className="panel-title"><h3>Token 定价</h3><div className="settings-card-actions">{editing ? <>
+      <button type="button" className="text-button" data-cancel-pricing disabled={saving} onClick={() => { setEditing(false); setError(""); }}>取消</button>
+      <button type="submit" form="pricing-settings-form" className="text-button" data-save-pricing disabled={saving}>{saving ? "保存中…" : "保存"}</button>
+    </> : <button className="text-button" data-edit-pricing onClick={() => { setDraft(toDraft(pricing)); setError(""); setEditing(true); }}>编辑</button>}</div></div>
     <p className="settings-description">用于首页价值估算的统一单价，单位：美元 / 百万 Token。留空表示未配置，0 表示免费；估算并非服务商账单。</p>
-    <form onSubmit={async e => {
+    <form id="pricing-settings-form" onSubmit={async e => {
       e.preventDefault(); setError("");
       const next = { ...blank };
       for (const [k] of prices) {
@@ -30,9 +33,7 @@ export function PricingSettings({ pricing, onRefresh }: { pricing: TokenPricing;
         {editing ? <input id={`price-${key}`} aria-label={label} name={`price-${key}`} type="number" min="0" max="1000000" step="any" placeholder="未配置" value={draft[key]} disabled={saving} onChange={e => setDraft({ ...draft, [key]: e.target.value })} /> : <span className="muted" data-price={key}>{pricing[key] === null ? "未配置" : `$${pricing[key]}`}</span>}
       </div>)}
       {error && <p role="alert" className="settings-message">{error}</p>}
-      {editing && <footer className="settings-actions"><button type="button" disabled={saving} onClick={() => setDraft(toDraft(blank))}>清空单价</button><span />
-        <button type="button" data-cancel-pricing disabled={saving} onClick={() => { setEditing(false); setError(""); }}>取消</button>
-        <button type="submit" className="primary" data-save-pricing disabled={saving}>{saving ? "保存中…" : "保存定价"}</button></footer>}
+      {editing && <footer className="settings-actions"><button type="button" disabled={saving} onClick={() => setDraft(toDraft(blank))}>清空单价</button></footer>}
     </form>
   </section>;
 }

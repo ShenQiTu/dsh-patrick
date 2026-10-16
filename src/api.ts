@@ -19,6 +19,7 @@ let preview: Snapshot = {
     timeoutSeconds: 120,
     streamIdleSeconds: 600,
     streamGraceSeconds: 10,
+    dshStreamIdleSeconds: 300,
     maxBodyMb: 64,
     bodyConcurrency: 16,
     upstreamConcurrency: 32,
@@ -27,7 +28,7 @@ let preview: Snapshot = {
     detailedLogging: false,
   },
   dataDirectory: "浏览器预览 · 数据只保留在当前页面内存",
-  appVersion: "0.1.7",
+  appVersion: "0.1.18",
   testMode: false,
   gatewayRunning: false,
   gatewayAvailable: false,
@@ -76,6 +77,8 @@ export const api = {
       extraEnabled,
       extraParams,
       thinkingBudget,
+      compactionPercent,
+      multimodal,
     } = input;
     if (native)
       return invoke<string>("save_model", {
@@ -100,6 +103,8 @@ export const api = {
           extraEnabled,
           extraParams,
           thinkingBudget,
+      compactionPercent,
+      multimodal,
         },
       });
     if (!input.name.trim() || !input.model.trim())

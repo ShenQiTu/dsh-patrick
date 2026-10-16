@@ -24,12 +24,19 @@ export async function runOverviewRegression() {
     const populated=Array.from(host.querySelectorAll<HTMLElement>('.token-column')).filter(el=>el.title.includes('1 次调用'));
     check(populated.length===2 && populated.map(el=>localDate(Number(el.dataset.bucketStart))).join()==='2026-10-13,2026-10-14','overview_cross_day_columns_separate');
     check(populated.every(el=>el.title.includes('不含结束时刻') && Number(el.dataset.bucketEnd)>Number(el.dataset.bucketStart)),'overview_tooltip_has_exact_interval');
+    check(populated.every(el=>!el.querySelector('.token-empty')),'populated_columns_without_grey_background');
+    check(!!host.querySelector('.token-empty'),'zero_columns_have_grey_placeholder');
+    check(Array.from(populated[0].querySelectorAll('.token-stack i')).map(el=>el.className).join() === 'token-input,token-read,token-write,token-output','reference_stack_order');
+    populated[0].dispatchEvent(new FocusEvent('focusin',{bubbles:true}));await pause();
+    check(!!host.querySelector('.token-tooltip')&&!!host.querySelector('.token-average'),'chart_hover_detail_and_average');
+    populated[0].dispatchEvent(new FocusEvent('focusout',{bubbles:true}));await pause();
     const savedTheme=document.documentElement.dataset.theme;
     for(const theme of ['light','dark']) {
       document.documentElement.dataset.theme=theme;
       for(const [width,height] of [[960,640],[820,550],[800,520]]) {
         await invoke('smoke_resize',{width,height});await until(()=>innerWidth===width && innerHeight===height,'resize');await pause();
         const tag=`${width}_${height}_${theme}`;
+        check(Array.from(host.querySelectorAll<HTMLElement>('.token-stack')).every(el=>el.getBoundingClientRect().width<=18.5),'chart_bar_max_18_'+tag);
         const bars=host.querySelectorAll<HTMLElement>('.token-column');
         for(const tick of host.querySelectorAll<HTMLElement>('[data-axis-index]')) {
           const b=bars[Number(tick.dataset.axisIndex)].getBoundingClientRect(),t=tick.getBoundingClientRect();

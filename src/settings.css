@@ -64,3 +64,14 @@
 .connection-check-details [data-state="pass"] em { color:var(--green); }
 .connection-check-details [data-state="fail"] em { color:var(--red); }
 .connection-check-details small { display:block; margin-top:4px; line-height:1.5; color:var(--muted); }
+
+.settings-card-actions { display:flex; align-items:center; gap:6px; }
+.settings-values { padding:16px; display:grid; gap:12px; }
+.settings-value-row { display:grid; grid-template-columns:minmax(0,1fr) minmax(100px,160px); align-items:center; gap:16px; min-height:34px; }
+.settings-value-row label { font-size:13px; font-weight:500; }
+.settings-value-row > span { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+.settings-value-row input { width:100%; min-width:0; text-align:right; }
+.settings-detail-toggle { border-top:1px solid var(--border); }
+.settings-detail-toggle .switch { flex-shrink:0; }
+.settings-groups [data-settings-group="appearance"] .select-control { width:160px; }
+.settings-actions { flex-wrap:wrap; }

@@ -39,6 +39,7 @@ const dateTime = (n: number) => new Date(n).toLocaleString("zh-CN", { year: "num
 
 export function Overview({ version, historyError, preset, custom, pricing }: { pricing: TokenPricing; version: number; historyError: string | null; preset: Preset; custom: Range | null }) {
   const [records, setRecords] = useState<UsageRecord[]>([]), [error, setError] = useState("");
+  const [hovered,setHovered]=useState<number|null>(null);
   const [source, setSource] = useState("gateway");
   useEffect(() => {
     let active = true;
@@ -50,6 +51,9 @@ export function Overview({ version, historyError, preset, custom, pricing }: { p
   const cost = estimateCost(data.selected, pricing);
   const days = calendar(records, range.end, source);
   const max = Math.max(1, ...data.buckets.map(b => b.input + b.output + b.read + b.write));
+  const nonempty=data.buckets.filter(b=>b.input+b.output+b.read+b.write>0);
+  const average=nonempty.length?nonempty.reduce((n,b)=>n+b.input+b.output+b.read+b.write,0)/nonempty.length:0;
+  const active=data.buckets.find(b=>b.start===hovered);
   const dayMax = Math.max(1, ...days.map(d => d.count));
   const rate = data.cacheRate;
   const rangeText = `${dateTime(range.start)} — ${dateTime(range.end)}`;
@@ -72,9 +76,11 @@ export function Overview({ version, historyError, preset, custom, pricing }: { p
     </div>
     <div className="token-chart" role="img" aria-label={`Token 用量趋势，${data.selected.length} 次调用，已上报 ${data.input + data.output} Token`}>
       <div className="token-bars">
-        {data.buckets.map(b => <div className="token-column" key={b.start} data-bucket-start={b.start} data-bucket-end={b.end} title={`${dateTime(b.start)} — ${dateTime(b.end)}（不含结束时刻）\n${b.calls} 次调用\n输入（非缓存）${b.input} · 输出 ${b.output}\n缓存读取 ${b.read} · 缓存写入 ${b.write}`}>
-          <div className="token-stack">{(["output", "input", "write", "read"] as const).map(k => <i key={k} className={`token-${k}`} style={{height:`${100*b[k]/max}%`}} />)}</div>
+        {data.buckets.map(b => <div className="token-column" tabIndex={0} onMouseEnter={()=>setHovered(b.start)} onMouseLeave={()=>setHovered(null)} onFocus={()=>setHovered(b.start)} onBlur={()=>setHovered(null)} key={b.start} data-bucket-start={b.start} data-bucket-end={b.end} title={`${dateTime(b.start)} — ${dateTime(b.end)}（不含结束时刻）\n${b.calls} 次调用\n输入（非缓存）${b.input} · 输出 ${b.output}\n缓存读取 ${b.read} · 缓存写入 ${b.write}`}>
+          <div className={`token-stack${b.input+b.output+b.read+b.write===0?" token-empty":""}`}>{(["input", "read", "write", "output"] as const).map(k => <i key={k} className={`token-${k}`} style={{height:`${100*b[k]/max}%`}} />)}</div>
         </div>)}
+        {active&&average>0&&<div className="token-average" style={{bottom:`${100*average/max}%`}}><span>平均 {number(average)}</span></div>}
+        {active&&<div className="token-tooltip" role="tooltip"><b>{dateTime(active.start)} — {dateTime(active.end)}</b><span>{active.calls} 次调用</span>{(["input","read","write","output"] as const).map((k,i)=><div key={k}><i className={`token-${k}`}/><span>{["输入（非缓存）","缓存读取","缓存写入","输出"][i]}</span><strong>{number(active[k])}</strong></div>)}</div>}
         {!data.reported && <p className="chart-empty">{data.selected.length ? "上游未返回 Token 用量" : "当前范围暂无调用"}</p>}
       </div>
       <div className="token-axis" aria-label={rangeText} style={{gridTemplateColumns:`repeat(${Math.max(1,data.buckets.length)},minmax(0,1fr))`}}>{axisTicks(data.buckets.length).map(i => <span key={i} data-axis-index={i} style={{gridColumn:i+1}} title={`${dateTime(data.buckets[i].start)} — ${dateTime(data.buckets[i].end)}`}><b>{axisLabel(data.buckets[i].labelAt)}</b></span>)}</div>

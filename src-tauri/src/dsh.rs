@@ -9,6 +9,7 @@ pub struct Status {
     pub configured: bool,
     pub model_count: usize,
     pub zen_count: usize,
+    #[serde(default)] pub model_vision: std::collections::BTreeMap<String,bool>,
     pub message: String,
     pub backup_directory: String,
     #[serde(default)] pub profile_valid: bool,
@@ -61,9 +62,9 @@ pub fn execute(directory: &Path, config: &Config, action: &str, port: u16) -> Re
 
 pub fn execute_detailed(directory: &Path, config: &Config, action: &str, port: u16) -> Result<Status, Failure> {
     let models: Vec<_> = config.models.iter().filter(|m| m.enabled).map(|m| serde_json::json!({
-        "id":m.id,"name":m.name,"model":m.model,"protocol":m.protocol,"contextWindow":m.context_window,"maxOutput":m.max_output
+        "id":m.id,"name":m.name,"model":m.model,"protocol":m.protocol,"contextWindow":m.context_window,"maxOutput":m.max_output,"compactionPercent":m.compaction_percent,"multimodal":m.multimodal
     })).collect();
-    let request=serde_json::json!({"action":action,"profile":config.settings.dsh_profile,"owner":directory.display().to_string(),"pid":std::process::id(),"port":port,"token":config.gateway_token,"models":models});
+    let request=serde_json::json!({"action":action,"profile":config.settings.dsh_profile,"owner":directory.display().to_string(),"pid":std::process::id(),"port":port,"token":config.gateway_token,"models":models,"dshStreamIdleSeconds":config.settings.dsh_stream_idle_seconds});
     let mut status:Status=serde_json::from_value(call(directory,request)?).map_err(|_| "DSH 接入状态解析失败")?;
     status.profile=config.settings.dsh_profile.clone();
     Ok(status)

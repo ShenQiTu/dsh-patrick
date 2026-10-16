@@ -145,15 +145,21 @@ pub fn prepare_body(model: &Model, mut body: Value) -> Result<Value, String> {
 
 pub fn test_body(model: &Model) -> Value {
     let prompt = "Reply with exactly: DSH Patrick connection OK.";
+    // Test-only budget: leave normal DSH forwarding and non-Zen probes unchanged.
+    // Zen reasoning and injected prompts can exhaust 512 tokens before any answer.
+    let output_limit = if model.zen_test_enabled { 20_000 } else { 512 };
     match model.protocol.as_str() {
         "responses" => {
-            json!({"model":model.id,"input":prompt,"stream":true,"max_output_tokens":512})
+            json!({"model":model.id,"input":prompt,"stream":true,"max_output_tokens":output_limit})
         }
         "anthropic" => {
-            json!({"model":model.id,"messages":[{"role":"user","content":prompt}],"stream":true,"max_tokens":model.thinking_budget.map_or(512, |n| n.saturating_add(512).min(model.max_output.unwrap_or(8192)))})
+            let max_tokens = if model.zen_test_enabled { output_limit } else {
+                model.thinking_budget.map_or(512, |n| n.saturating_add(512).min(model.max_output.unwrap_or(8192)))
+            };
+            json!({"model":model.id,"messages":[{"role":"user","content":prompt}],"stream":true,"max_tokens":max_tokens})
         }
         _ => {
-            json!({"model":model.id,"messages":[{"role":"user","content":prompt}],"stream":true,"max_completion_tokens":512,"stream_options":{"include_usage":true}})
+            json!({"model":model.id,"messages":[{"role":"user","content":prompt}],"stream":true,"max_completion_tokens":output_limit,"stream_options":{"include_usage":true}})
         }
     }
 }

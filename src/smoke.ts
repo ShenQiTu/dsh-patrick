@@ -529,6 +529,8 @@ export async function runSmoke() {
     (await wait('[aria-label="刷新"]')).click();
     (await wait('[data-nav="settings"]')).click();
     await wait('[role="combobox"][aria-label="界面主题"]');
+    (await wait('[data-edit-settings="gateway"]')).click();
+    (await wait('[data-edit-settings="concurrency"]')).click();
     assert(
       ((await wait('input[name="maxBodyMb"]')) as HTMLInputElement).value ===
         "64",

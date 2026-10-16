@@ -21,6 +21,8 @@ export interface Model {
   extraEnabled: boolean;
   extraParams: Record<string, unknown>;
   thinkingBudget: number | null;
+  compactionPercent: number | null;
+  multimodal: boolean | null;
 }
 export type ModelInput = Omit<Model, "id" | "hasKey" | "apiKey"> & {
   id: string | null;
@@ -32,6 +34,7 @@ export interface Settings {
   timeoutSeconds: number;
   streamIdleSeconds: number;
   streamGraceSeconds: number;
+  dshStreamIdleSeconds: number;
   maxBodyMb: number;
   bodyConcurrency: number;
   upstreamConcurrency: number;
@@ -55,7 +58,7 @@ export interface Snapshot {
   dshConnected: boolean;
   dshRecoveryPending: boolean;
   closeRequest: {id:string; exit:boolean; message:string} | null;
-  dsh: {profile:string; configured:boolean; modelCount:number; zenCount:number; message:string; backupDirectory:string;profileValid:boolean;checkedAt:number;syncState:string;checks:{id:string;label:string;state:"pass"|"fail"|"unchecked";detail:string}[]};
+  dsh: {modelVision?:Record<string,boolean>;profile:string; configured:boolean; modelCount:number; zenCount:number; message:string; backupDirectory:string;profileValid:boolean;checkedAt:number;syncState:string;checks:{id:string;label:string;state:"pass"|"fail"|"unchecked";detail:string}[]};
   trayAvailable: boolean;
   runtime: {
     lastDshRequest: number;
@@ -138,6 +141,8 @@ export function emptyModel(): ModelInput {
     extraEnabled: false,
     extraParams: {},
     thinkingBudget: null,
+    compactionPercent: 85,
+    multimodal: false,
   };
 }
 

@@ -14,12 +14,11 @@ export async function runCallsRegression() {
   async function click(s:string) {check(!!q(s),"exists_"+s);q(s).click();await wait();}
   async function select(label:string,text:string) {await click(`[role="combobox"][aria-label="${label}"]`);const option=Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(e=>e.textContent===text);check(option,"option_"+text);option!.click();await wait();}
   await click('[data-nav="settings"]');
-  check(!!q('[data-settings-group="gateway"] [name="maxBodyMb"]'),"gateway_body_size_group");
-  check(!!q('[data-settings-group="concurrency"] [name="bodyConcurrency"]') && !!q('[data-settings-group="concurrency"] [name="upstreamConcurrency"]'),"concurrency_separate_group");
+  check(!!q('[data-settings-group="gateway"] [data-setting-value="maxBodyMb"]'),"gateway_body_size_group");
+  check(!!q('[data-settings-group="concurrency"] [data-setting-value="bodyConcurrency"]') && !!q('[data-settings-group="concurrency"] [data-setting-value="upstreamConcurrency"]'),"concurrency_separate_group");
   check(!!q('[data-settings-group="appearance"] [aria-label="界面主题"]'),"theme_separate_group");
   check(!!q('[data-settings-group="calls"] [aria-label="详细记录"]'),"calls_separate_group");
   await click('[aria-label="详细记录"]');
-  (q('.settings-groups') as HTMLFormElement).requestSubmit();
   await until(async()=> (await api.snapshot()).settings.detailedLogging,"detail option saved");
   const state=await api.snapshot();
   const id=await api.save({...emptyModel(),name:"Calls detail fixture",model:"native-mock",baseUrl:state.testUpstream!,apiKey:"SYNTHETIC_CALLS_KEY",zenTestEnabled:true});

@@ -18,6 +18,9 @@ export async function runSettingsRegression() {
   }
   await click('[data-nav="settings"]');
   const originalSettings=(await api.snapshot()).settings;
+  check(!q('.settings-groups input'), 'numeric_cards_initially_read_only');
+  check(q('[data-setting-value="dshStreamIdleSeconds"]').textContent?.includes('300'), 'dsh_wait_default_300');
+  await click('[data-edit-settings="gateway"]');
   const timeout=q('[name="timeoutSeconds"]') as HTMLInputElement;
   check(timeout.min==='5' && timeout.max==='700', 'timeout_range_5_to_700');
   for(const value of ['4','701','699.5']) {
@@ -26,10 +29,10 @@ export async function runSettingsRegression() {
   }
   await input('[name="timeoutSeconds"]','700');
   check(timeout.checkValidity(),'timeout_accepts_700');
-  (q('form.settings-groups') as HTMLFormElement).requestSubmit();
+  (q('#settings-gateway') as HTMLFormElement).requestSubmit();
   await until(async()=> (await api.snapshot()).settings.timeoutSeconds===700,'timeout persisted through settings form');
   await click('[aria-label="刷新"]');
-  check((q('[name="timeoutSeconds"]') as HTMLInputElement).value==='700','timeout_700_saved_and_reloaded');
+  check(q('[data-setting-value="timeoutSeconds"]').textContent?.includes('700'),'timeout_700_saved_and_reloaded');
   let rejected=false;
   try {await api.settings({...originalSettings,timeoutSeconds:701});} catch {rejected=true;}
   check(rejected,'timeout_backend_rejects_701');
@@ -37,19 +40,43 @@ export async function runSettingsRegression() {
   await api.settings(originalSettings);await click('[aria-label="刷新"]');
   check(!!q('[data-settings-group="stream-timeout"]'), 'stream_timeout_separate_group');
   check(q('[data-stream-wait]').textContent?.includes('610 秒'), 'stream_wait_default_600_plus_10');
+  await click('[data-edit-settings="stream-timeout"]');
   for (const [field,bad] of [['streamIdleSeconds','4'],['streamIdleSeconds','7201'],['streamGraceSeconds','0'],['streamGraceSeconds','61']]) {
     await input(`[name="${field}"]`,bad);
     check(!(q(`[name="${field}"]`) as HTMLInputElement).checkValidity(),'stream_invalid_'+field+'_'+bad);
   }
   await input('[name="streamIdleSeconds"]','180');await input('[name="streamGraceSeconds"]','10');
-  check(q('[data-stream-wait]').textContent?.includes('190 秒'),'stream_effective_wait_preview');
-  (q('form.settings-groups') as HTMLFormElement).requestSubmit();
+  check(q('[data-stream-wait]').textContent?.includes('610 秒'),'stream_saved_value_not_unsaved_draft');
+  (q('#settings-stream-timeout') as HTMLFormElement).requestSubmit();
   await until(async()=> (await api.snapshot()).settings.streamIdleSeconds===180, 'stream wait saved');
   await click('[aria-label="刷新"]');
-  check((q('[name="streamGraceSeconds"]') as HTMLInputElement).value==='10', 'stream_grace_saved_and_reloaded');
+  check(q('[data-setting-value="streamGraceSeconds"]').textContent?.includes('10'), 'stream_grace_saved_and_reloaded');
   let invalidStream=false;
   try {await api.settings({...originalSettings,streamIdleSeconds:7201});} catch {invalidStream=true;}
   check(invalidStream && (await api.snapshot()).settings.streamIdleSeconds===180, 'stream_backend_validation_preserves_previous');
+  await api.settings(originalSettings);await click('[aria-label="刷新"]');
+  await click('[data-edit-settings="gateway"]');
+  await input('[name="timeoutSeconds"]','333');
+  await click('[data-edit-settings="dsh-timeout"]');
+  await input('[name="dshStreamIdleSeconds"]','900');
+  await click('[aria-label="刷新"]');
+  check((q('[name="timeoutSeconds"]') as HTMLInputElement).value==='333', 'draft_survives_refresh');
+  await click('[data-save-settings="dsh-timeout"]');
+  await until(async()=> (await api.snapshot()).settings.dshStreamIdleSeconds===900,'dsh wait saved');
+  check((await api.snapshot()).settings.timeoutSeconds===originalSettings.timeoutSeconds,'independent_save_excludes_other_draft');
+  check((q('[name="timeoutSeconds"]') as HTMLInputElement).value==='333','other_card_draft_preserved');
+  await click('[data-cancel-settings="gateway"]');
+  check((await api.snapshot()).settings.timeoutSeconds===originalSettings.timeoutSeconds,'cancel_leaves_persisted_value');
+  const settingsApi=api.settings;
+  try {
+    api.settings=async()=>{throw new Error('SYNTHETIC_SAVE_ERROR');};
+    await click('[data-edit-settings="dsh-timeout"]');await input('[name="dshStreamIdleSeconds"]','901');
+    await click('[data-save-settings="dsh-timeout"]');
+    check(q('[data-settings-group="dsh-timeout"] [role="alert"]').textContent?.includes('SYNTHETIC_SAVE_ERROR'),'save_failure_visible');
+    check((q('[name="dshStreamIdleSeconds"]') as HTMLInputElement).value==='901'&&!(q('[data-save-settings="dsh-timeout"]') as HTMLButtonElement).disabled,'failed_save_keeps_editor_and_ends_loading');
+    check((await api.snapshot()).settings.dshStreamIdleSeconds===900,'failed_save_preserves_value');
+    await click('[data-cancel-settings="dsh-timeout"]');
+  } finally {api.settings=settingsApi;}
   await api.settings(originalSettings);await click('[aria-label="刷新"]');
   for (const s of [".pricing-settings", ".application-settings", ".storage-settings"]) check(!!q(s), s + "_rendered");
   check(!q("form form"), "independent_forms_not_nested");

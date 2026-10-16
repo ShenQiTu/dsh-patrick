@@ -79,6 +79,12 @@ export async function runUIRegression(): Promise<string[]> {
   await size(960, 640);
   await theme("light");
   await openEditor();
+  assert((q('[name="compactionPercent"]') as HTMLInputElement).value==='85','compaction_default_85');
+  assert(q('[aria-label="多模态（识图）"]').getAttribute('aria-checked')==='false','new_model_vision_default_off');
+  await input('[name="compactionPercent"]','90');
+  await click('[aria-label="多模态（识图）"]');
+  assert(q('[aria-label="多模态（识图）"]').getAttribute('aria-checked')==='true','vision_switch_works');
+  assert(!q('dialog')!.textContent?.includes('有效触发点'),'no_compaction_budget_preview');
   await input('[name="baseUrl"]', upstream);
   await click("[data-discover-models]");
   await until(() => all('[role="option"]').length === 2, "discovery");
@@ -345,7 +351,6 @@ export async function runUIRegression(): Promise<string[]> {
   assert(all(".call-row").length === 1, "custom_call_source_reset");
   await page("settings");
   await choose("界面主题", "浅色");
-  (q("main form") as HTMLFormElement).requestSubmit();
   await until(
     () => document.documentElement.dataset.theme === "light",
     "theme UI save",

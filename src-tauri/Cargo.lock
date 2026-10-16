@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-patrick"
-version = "0.1.16"
+version = "0.1.18"
 dependencies = [
  "axum",
  "futures-util",

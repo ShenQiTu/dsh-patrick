@@ -45,8 +45,14 @@ export interface Settings {
 export interface TokenPricing { input: number | null; output: number | null; cacheRead: number | null; cacheWrite: number | null }
 export interface AutostartStatus { enabled: boolean; currentExecutable: boolean }
 export interface StorageInfo { calls: number; bytes: number; historyError: string | null }
-export interface UpdateInfo { version: string; state: "available" | "current" | "ahead" }
+export interface UpdateInfo {
+  version: string;
+  state: "idle" | "checking" | "available" | "current" | "ahead" | "downloading" | "waiting" | "installing" | "error";
+  available: boolean; busy: boolean; downloaded: number; total: number; message: string; lastCheckedAt: number;
+  lastResult?: string;
+}
 export interface Snapshot {
+  update?: UpdateInfo;
   pricing: TokenPricing;
   models: Model[];
   settings: Settings;

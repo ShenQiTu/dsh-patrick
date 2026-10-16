@@ -21,6 +21,7 @@
 !/src-tauri/Cargo.lock
 !/src-tauri/build.rs
 !/src-tauri/tauri.conf.json
+!/src-tauri/update-public-key.txt
 
 /tools/*
 !/tools/dsh-bridge.test.cjs
@@ -28,6 +29,8 @@
 !/tools/dsh-diagnostics.test.cjs
 !/tools/zen-compat.test.cjs
 !/tools/model-options.test.cjs
+!/tools/dsh-retry.test.cjs
+!/tools/create-update.mjs
 !/tools/build-bridge.mjs
 !/tools/package-runtime.ps1
 !/tools/dsh-runtime.test.mjs

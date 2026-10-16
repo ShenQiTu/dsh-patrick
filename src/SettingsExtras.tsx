@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, native } from "./api";
 import { Modal, Switch } from "./ui";
-import type { AutostartStatus, Snapshot, StorageInfo, TokenPricing } from "./types";
+import type { AutostartStatus, Snapshot, StorageInfo, TokenPricing, UpdateInfo } from "./types";
 
 const prices: [keyof TokenPricing, string][] = [["input", "输入价格"], ["output", "输出价格"], ["cacheRead", "缓存读取价格"], ["cacheWrite", "缓存写入价格"]];
 const blank: TokenPricing = { input: null, output: null, cacheRead: null, cacheWrite: null };
@@ -38,9 +38,9 @@ export function PricingSettings({ pricing, onRefresh }: { pricing: TokenPricing;
   </section>;
 }
 
-export function ApplicationSettings({ version }: { version: string }) {
-  const [startup, setStartup] = useState<AutostartStatus | null>(null), [busy, setBusy] = useState(false), [checking, setChecking] = useState(false);
-  const [startupError, setStartupError] = useState(""), [update, setUpdate] = useState("");
+export function ApplicationSettings({ version, update, onRefresh }: { version: string; update?: UpdateInfo; onRefresh: () => Promise<void> }) {
+  const [startup, setStartup] = useState<AutostartStatus | null>(null), [busy, setBusy] = useState(false);
+  const [startupError, setStartupError] = useState("");
   useEffect(() => {
     let active = true;
     if (native) api.autostartStatus().then(s => { if (active) setStartup(s); }).catch(e => { if (active) setStartupError(String(e)); });
@@ -54,15 +54,35 @@ export function ApplicationSettings({ version }: { version: string }) {
         api.setAutostart(!startup?.enabled).then(setStartup).catch(e => setStartupError(String(e))).finally(() => setBusy(false));
       }} /></div>
     {startupError && <p role="alert" className="settings-message">{startupError}</p>}
-    <div className="settings-row"><div><b>软件更新</b><small>当前版本 {version} · 仅手动检查，不自动下载或安装。</small></div>
-      <button data-check-update disabled={!native || checking} onClick={async () => {
-        setChecking(true); setUpdate("");
-        try { const info = await api.checkUpdate(); setUpdate(info.state === "available" ? `发现新版本 ${info.version}，可打开发布页下载。` : info.state === "current" ? `当前已是最新正式版 ${info.version}。` : `当前版本高于已发布正式版 ${info.version}。`); }
-        catch (e) { setUpdate(String(e)); }
-        finally { setChecking(false); }
-      }}>{checking ? "检查中…" : "检查更新"}</button></div>
-    {update && <div className="settings-update-result"><p role="status" data-update-result>{update}</p><button disabled={!native} onClick={() => void api.openReleasePage().catch(e => setUpdate(String(e)))}>打开发布页</button></div>}
+    <UpdateSettings version={version} update={update} onRefresh={onRefresh} />
   </section>;
+}
+
+export function UpdateSettings({version,update,onRefresh}:{version:string;update?:UpdateInfo;onRefresh:()=>Promise<void>}) {
+  const [checking,setChecking]=useState(false),[starting,setStarting]=useState(false),[error,setError]=useState("");
+  const working=!!update?.busy||starting, checkBusy=checking||update?.state==="checking";
+  const progress=update?.total?Math.min(100,Math.round(update.downloaded/update.total*100)):0;
+  return <div className="update-settings" data-update-settings>
+    <div className="settings-row"><div><b>软件更新</b><small>当前版本 {version} · 启动及每 6 小时检查，点击后下载并安装。</small></div>
+      <div className="update-buttons">
+        {update?.available && <button data-install-update disabled={!native||working||checkBusy} onClick={async()=>{
+          if(starting||working)return;setStarting(true);setError("");
+          try {await api.installUpdate(update.version);await onRefresh();}catch(e){setError(String(e));}finally{setStarting(false);}
+        }}><span className="update-dot" aria-hidden="true" />{working?"更新中…":`下载并安装 v${update.version}`}</button>}
+        <button data-check-update disabled={!native||checkBusy||working} onClick={async()=>{
+          setChecking(true);setError("");try{await api.checkUpdate();await onRefresh();}catch(e){setError(String(e));}finally{setChecking(false);}
+        }}>{checkBusy?"检查中…":"检查更新"}</button>
+      </div>
+    </div>
+    {(error||update?.message) && <div className="settings-update-result"><p role="status" aria-live="polite" data-update-result className={error||update?.state==="error"?"update-error":""}>{error||update?.message}</p></div>}
+    {update?.lastResult && <p className="settings-message" data-last-update-result>{update.lastResult}</p>}
+    {working && <div className="update-progress" data-update-progress>
+      <progress aria-label="更新下载进度" value={progress} max={100} /><span>{update?.state==="waiting"?"等待空闲":update?.state==="installing"?"正在安装":`${progress}%`}</span>
+      {update?.state!=="installing" && <button data-cancel-update onClick={()=>void api.cancelUpdate().then(onRefresh).catch(e=>setError(String(e)))}>取消更新</button>}
+    </div>}
+    <div className="settings-actions"><button className="text-button" data-release-page disabled={!native||working} onClick={()=>void api.openReleasePage().catch(e=>setError(String(e)))}>打开发布页</button>
+      <small className="update-hint">更新保留模型和配置；有请求时等待空闲，启动失败恢复旧版。</small></div>
+  </div>;
 }
 
 export function StorageSettings({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: () => Promise<void> }) {

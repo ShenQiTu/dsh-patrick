@@ -777,12 +777,15 @@ dependencies = [
 
 [[package]]
 name = "dsh-patrick"
-version = "0.1.18"
+version = "0.1.20"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "getrandom 0.3.4",
  "reqwest 0.12.28",
+ "ring",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

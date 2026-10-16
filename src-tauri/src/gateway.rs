@@ -143,6 +143,7 @@ impl Gateway {
     pub fn pause_if_idle(&self) -> Result<Pause<'_>, String> {
         let mut paused=self.admission.lock().map_err(|_| "请求状态锁异常")?;
         if self.active.load(Ordering::SeqCst)>0 || self.pending.load(Ordering::SeqCst)>0 { return Err("仍有请求进行中或排队中，请结束后再断开".into()); }
+        if *paused { return Err("网关正在维护，请稍后再试".into()); }
         *paused=true;
         Ok(Pause(self))
     }

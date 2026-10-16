@@ -1,6 +1,6 @@
 [package]
 name = "dsh-patrick"
-version = "0.1.18"
+version = "0.1.20"
 edition = "2021"
 publish = false
 
@@ -17,6 +17,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 futures-util = "0.3"
 getrandom = "0.3"
+ring = "0.17.14"
+base64 = "0.22.1"
+semver = "1.0.28"
 
 [profile.dev]
 debug = 0

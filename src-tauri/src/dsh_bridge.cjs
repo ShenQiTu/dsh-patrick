@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const YAML = require('yaml');
 const compaction = require('./dsh_compaction.cjs');
+const retry = require('./dsh_retry.cjs');
 const { execFileSync } = require('node:child_process');
 const { isDeepStrictEqual: equal } = require('node:util');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
@@ -158,7 +159,7 @@ function removeOwned(y,current,journal) {
       const p=y.providers(doc),ep=y.providers(expected);
       for(const name of journal.routes) {
         const prior=journal.previous ? y.providers(y.parse(journal.previous.after.profile)).get(name) : undefined;
-        if(p.has(name) && !equal(plain(p.get(name)),plain(ep.get(name))) && !equal(plain(p.get(name)),plain(prior)))fail('Patrick 模型入口被外部修改，已保留现场；请核对后重试恢复');
+        if(p.has(name) && !retry.compatible(plain(p.get(name)),plain(ep.get(name))) && !retry.compatible(plain(p.get(name)),plain(prior)))fail('Patrick 模型入口被外部修改，已保留现场；请核对后重试恢复');
         p.delete(name);
       }
       compaction.remove(y,doc,journal);
@@ -298,7 +299,7 @@ async function runChecked(input,diagnostics) {
     const d=y.parse(current.profile), c=y.parse(current.credentials), e=y.parse(j.after.profile);
     const rules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','models']))??[];
     const scopedRules=plain(y.row(d,'llm-zen-session-headers')?.getIn(['config','routes']))??[];
-    const configured=compaction.present(y,d,j) && ownedZenRoutes(j).every(rule=>scopedRules.some(r=>equal(r,rule))) && j.routes.every(r=>equal(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
+    const configured=compaction.present(y,d,j) && ownedZenRoutes(j).every(rule=>scopedRules.some(r=>equal(r,rule))) && j.routes.every(r=>retry.compatible(plain(y.providers(d).get(r)),plain(y.providers(e).get(r)))) && j.zenIds.every(id=>rules.includes(id)) && c.getIn(['refs',j.ref])===y.parse(j.after.credentials).getIn(['refs',j.ref]);
     return {...status,configured,modelCount:j.modelCount,zenCount:j.zenIds.length+ownedZenRoutes(j).reduce((n,r)=>n+r.models.length,0),message:configured?(j.compactionWarning?j.compactionWarning+'；':'')+'配置已同步；DSH 是否加载以客户端模型列表及请求记录为准'+(j.zenAmbiguous?`；${j.zenAmbiguous} 个源模型存在跨 provider 同名歧义，未自动追加 Zen 规则，请核对插件精确 routes`:''):'配置已变化，请重新同步',backupDirectory:directory};
   }
   privateDirectory(directory);
@@ -308,8 +309,19 @@ async function runChecked(input,diagnostics) {
     if(old && old.pid!==input.pid && alive(old.pid))fail('另一 Patrick 实例正在使用此 DSH profile');
     const beforeRead={profile:read(file),credentials:exists(credentials)?read(credentials):'version: 1\nrefs: {}\n'};
     const base=old?removeOwned(y,beforeRead,old):beforeRead;
+    const optionsFile=path.join(directory,'provider-options.json');ordinary(optionsFile);
+    const optionsBefore=optionalFile(optionsFile,'Patrick 重试配置保留记录')?readChecked(optionsFile,'Patrick 重试配置保留记录'):null;
+    const options=retry.capture(plain(y.providers(y.parse(beforeRead.profile))),old,retry.parseSaved(optionsBefore));
+    const optionsAfter=JSON.stringify({version:1,providers:options});
+    async function retainOptions() {
+      if(read(file)!==beforeRead.profile || (exists(credentials)?read(credentials):'version: 1\nrefs: {}\n')!==beforeRead.credentials || (exists(optionsFile)?read(optionsFile):null)!==optionsBefore)fail('DSH 文件在同步期间发生变化，请重试');
+      // Persist only the externally supplied policy, before removing its provider.
+      // On an interrupted operation the live policy is still the authority next time.
+      if(optionsBefore!==optionsAfter && (optionsBefore!==null||Object.keys(options).length))await atomic(optionsFile,optionsAfter,directory);
+    }
     if(input.action==='disconnect') {
       if(!old)return {...status,message:'未发现需要恢复的 Patrick 接入'};
+      await retainOptions();
       // Detach routes first, then revoke the loopback credential.
       await atomic(file,base.profile,directory);
       if(old.credentialsExisted===false && base.credentials==='version: 1\nrefs: {}\n') {if(exists(credentials))fs.unlinkSync(credentials);}
@@ -321,6 +333,7 @@ async function runChecked(input,diagnostics) {
     const doc=y.parse(base.profile),c=y.parse(base.credentials);const ref='DSH_PATRICK_LOCAL_TOKEN';
     if(process.env[ref] && process.env[ref]!==input.token)fail('环境变量覆盖 Patrick 本机令牌，请先清理同名环境变量');
     const generated=generate(y,doc,input,ref);
+    retry.apply(generated.providers,options);
     const p=y.providers(doc);
     for(const name of Object.keys(generated.providers))if(p.has(name))fail('DSH 中已有同名 Patrick provider，原配置已保留');
     if(c.hasIn(['refs',ref]))fail('DSH 中已有同名本机令牌引用，原凭据已保留');
@@ -349,6 +362,7 @@ async function runChecked(input,diagnostics) {
     // Journal is durable before either file changes. Next sync/disconnect can recover partial commits.
     // It records both the previous and new ownership states for interrupted resynchronization.
     journal.previous=old;
+    await retainOptions();
     await atomic(stateFile,JSON.stringify(journal),directory);
     try {
       if(read(file)!==beforeRead.profile || (exists(credentials)?read(credentials):'version: 1\nrefs: {}\n')!==beforeRead.credentials)fail('DSH 文件在同步期间发生变化，请重试');
@@ -357,8 +371,8 @@ async function runChecked(input,diagnostics) {
       await atomic(stateFile,JSON.stringify(journal),directory);
     } catch(e) {
       // Roll back only bytes still owned by this transaction, never an intervening edit.
-      if(read(file)===after.profile)await atomic(file,beforeRead.profile,directory);
-      if(exists(credentials)&&read(credentials)===after.credentials)await atomic(credentials,beforeRead.credentials,directory);
+      if(after.profile!==beforeRead.profile&&read(file)===after.profile)await atomic(file,beforeRead.profile,directory);
+      if(after.credentials!==beforeRead.credentials&&exists(credentials)&&read(credentials)===after.credentials)await atomic(credentials,beforeRead.credentials,directory);
       if(read(file)===beforeRead.profile && (!exists(credentials)||read(credentials)===beforeRead.credentials)) {
         if(old)await atomic(stateFile,JSON.stringify(old),directory);
         else {if(!journal.credentialsExisted&&exists(credentials))fs.unlinkSync(credentials);fs.unlinkSync(stateFile);}

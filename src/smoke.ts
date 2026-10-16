@@ -574,6 +574,8 @@ export async function runSmoke() {
     checks.push(...(await runCallsRegression()));
     const { runSettingsRegression } = await import("./settingsRegression");
     checks.push(...(await runSettingsRegression()));
+    const { runUpdateRegression } = await import("./updateRegression");
+    checks.push(...(await runUpdateRegression()));
     const { runOverviewRegression } = await import("./overviewRegression");
     checks.push(...(await runOverviewRegression()));
     await invoke("smoke_finish", { checks });

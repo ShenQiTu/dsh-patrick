@@ -75,3 +75,14 @@
 .settings-detail-toggle .switch { flex-shrink:0; }
 .settings-groups [data-settings-group="appearance"] .select-control { width:160px; }
 .settings-actions { flex-wrap:wrap; }
+.update-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:#ef4444; flex-shrink:0; }
+.menu-update-dot { margin-left:auto; }
+.update-buttons { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; flex-shrink:0; }
+.update-buttons button { display:inline-flex; gap:6px; align-items:center; }
+.update-settings .settings-row { flex-wrap:wrap; }
+.update-settings .settings-update-result { padding-bottom:12px; }
+.update-settings .update-error { color:var(--red); }
+.update-progress { padding:0 16px 16px; display:flex; align-items:center; gap:10px; }
+.update-progress progress { flex:1; min-width:0; height:8px; accent-color:var(--blue); }
+.update-progress > span { font-size:12px; color:var(--muted); white-space:nowrap; }
+.update-hint { font-size:12px; color:var(--muted); line-height:1.5; }

@@ -1,12 +1,10 @@
-//! Explicit user actions only: current-user startup entry and public release checks.
+//! Current-user startup entry and release-page link. Signed updates live in update.rs.
 use serde::Serialize;
-use std::{ffi::c_void, ptr::null, time::Duration};
-use futures_util::StreamExt;
+use std::{ffi::c_void, ptr::null};
 
 pub const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "DSH Patrick";
 const TEST_ROOT: &str = r"Software\DSHPatrickTests\";
-const RELEASE_API: &str = "https://api.github.com/repos/ShenQiTu/dsh-patrick/releases/latest";
 const RELEASE_PAGE: &str = "https://github.com/ShenQiTu/dsh-patrick/releases";
 type Hkey = *mut c_void;
 const HKCU: Hkey = 0x80000001u32 as i32 as isize as Hkey;
@@ -72,43 +70,6 @@ pub fn set_autostart(key: &str, enabled: bool) -> Result<AutostartStatus, String
     Ok(status)
 }
 
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateInfo { pub version: String, pub state: String }
-fn version(s: &str) -> Result<(u32,u32,u32), String> {
-    let parts: Vec<_> = s.strip_prefix('v').unwrap_or(s).split('.').collect();
-    if parts.len()!=3 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) { return Err("发布版本号格式错误".into()); }
-    Ok((parts[0].parse().map_err(|_| "版本号超出范围")?, parts[1].parse().map_err(|_| "版本号超出范围")?, parts[2].parse().map_err(|_| "版本号超出范围")?))
-}
-fn release_info(body: &[u8], current: &str) -> Result<UpdateInfo, String> {
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| "发布信息格式错误")?;
-    if value.get("draft").and_then(|v|v.as_bool()) != Some(false) || value.get("prerelease").and_then(|v|v.as_bool()) != Some(false) {
-        return Err("发布信息不是正式版本".into());
-    }
-    let tag = value.get("tag_name").and_then(|v|v.as_str()).ok_or("发布信息缺少版本号")?;
-    let ordering = version(tag)?.cmp(&version(current)?);
-    Ok(UpdateInfo { version: tag.into(), state: match ordering { std::cmp::Ordering::Greater=>"available",std::cmp::Ordering::Equal=>"current",std::cmp::Ordering::Less=>"ahead" }.into() })
-}
-async fn check_at(url: &str, current: &str) -> Result<UpdateInfo, String> {
-    let response = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15)).build().map_err(|_| "更新检查初始化失败")?
-        .get(url).header("user-agent", "DSH-Patrick-update-check").header("accept", "application/vnd.github+json")
-        .send().await.map_err(|_| "连接 GitHub 失败或超时，请稍后重试")?;
-    match response.status().as_u16() {
-        200 => {},
-        404 => return Err("仓库未公开、不可访问或尚无正式发布；可打开发布页登录后查看".into()),
-        403 | 429 => return Err("GitHub 暂时限制更新检查频率，请稍后重试".into()),
-        _ => return Err(format!("检查更新返回 HTTP {}，请稍后重试", response.status().as_u16())),
-    }
-    let mut data=Vec::new();let mut stream=response.bytes_stream();
-    while let Some(chunk)=stream.next().await {
-        let bytes=chunk.map_err(|_| "读取更新信息失败或超时")?;
-        if data.len()+bytes.len()>256*1024 {return Err("发布信息超过大小限制".into());}
-        data.extend_from_slice(&bytes);
-    }
-    release_info(&data,current)
-}
-pub async fn check_update() -> Result<UpdateInfo, String> { check_at(RELEASE_API,env!("CARGO_PKG_VERSION")).await }
 pub fn open_release_page() -> Result<(), String> {
     let result=unsafe { ShellExecuteW(std::ptr::null_mut(),wide("open").as_ptr(),wide(RELEASE_PAGE).as_ptr(),null(),null(),1) };
     if result<=32 { Err("打开默认浏览器失败".into()) } else { Ok(()) }
@@ -128,25 +89,5 @@ mod tests {
         assert!(!set_autostart(&key.0,false).unwrap().enabled);
         assert!(!set_autostart(&key.0,false).unwrap().enabled);
         println!("AUTOSTART_PASS isolated_non_run_registry=YES enabled_verified=YES disabled_verified=YES real_run_key_untouched=YES");
-    }
-    #[tokio::test]
-    async fn release_check_local_http_and_failure_paths() {
-        use axum::{Router, routing::get, response::IntoResponse};
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
-        let app=Router::new().route("/latest", get(|headers:axum::http::HeaderMap|async move {
-            assert!(!headers.contains_key("authorization") && !headers.contains_key("cookie"));
-            axum::Json(serde_json::json!({"tag_name":"v0.1.9","draft":false,"prerelease":false,"html_url":"https://example.invalid/untrusted"}))
-        })).route("/private",get(||async{(axum::http::StatusCode::NOT_FOUND,"ignored").into_response()}))
-        .route("/redirect",get(||async{(axum::http::StatusCode::FOUND,[("location","/latest")],"").into_response()}));
-        let task=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
-        let base=format!("http://127.0.0.1:{port}");
-        for (v,state) in [("0.1.8","available"),("0.1.9","current"),("0.1.10","ahead")] {
-            assert_eq!(check_at(&format!("{base}/latest"),v).await.unwrap().state,state);
-        }
-        assert!(check_at(&format!("{base}/private"),"0.1.6").await.unwrap_err().contains("仓库未公开"));
-        assert!(check_at(&format!("{base}/redirect"),"0.1.6").await.unwrap_err().contains("302"));
-        for bad in ["-1.2.3","1.2","1.2.3;start","1.2.3-beta","1.2.999999999999999"] {assert!(version(bad).is_err());}
-        assert!(release_info(br#"{"tag_name":"v9.0.0","draft":true,"prerelease":false}"#,"0.1.6").is_err());
-        task.abort();println!("UPDATES_PASS version_compare=YES private404=ERROR redirects=BLOCKED credentials=NONE loopback_only=YES");
     }
 }

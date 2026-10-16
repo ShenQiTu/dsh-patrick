@@ -69,6 +69,24 @@ export function App() {
     [confirmClear, setConfirmClear] = useState(false),
     [batch, setBatch] = useState(false);
   const [closeBusy,setCloseBusy]=useState(false),[closeError,setCloseError]=useState("");
+  const announcedUpdate=useRef("");
+  useEffect(()=>{
+    if(state?.update?.available && state.update.version!==announcedUpdate.current) {
+      announcedUpdate.current=state.update.version;setNotice(`发现新版本 v${state.update.version}，可在系统设置中下载安装。`);
+    }
+  },[state?.update?.available,state?.update?.version]);
+  useEffect(()=>{
+    if(!native)return;
+    let done=false,pending=false;
+    const ready=async()=>{if(done||pending)return;pending=true;try{done=await api.updateReady();}catch{}finally{pending=false;}};
+    void ready();const timer=setInterval(()=>void ready(),500);return()=>{done=true;clearInterval(timer);};
+  },[]);
+  useEffect(()=>{
+    if(!native||!state||state.testMode)return;
+    const check=()=>{if(document.visibilityState==="visible")void api.checkUpdate(true).catch(()=>{});};
+    window.addEventListener("focus",check);window.addEventListener("online",check);document.addEventListener("visibilitychange",check);
+    return()=>{window.removeEventListener("focus",check);window.removeEventListener("online",check);document.removeEventListener("visibilitychange",check);};
+  },[state?.testMode]);
   useEffect(()=>setCloseError(""),[state?.closeRequest?.id]);
   const cancelled = useRef(false),
     activeTests = useRef(new Set<string>());
@@ -260,6 +278,7 @@ export function App() {
             >
               <Icon name={pages[id].icon} size={18} />
               <span>{pages[id].title}</span>
+              {id==="settings" && state?.update?.available && <span data-update-dot className="update-dot menu-update-dot" title={`发现新版本 v${state.update.version}`} aria-label="有新版本" />}
             </button>
           ))}
         </nav>
@@ -763,7 +782,7 @@ function SettingsPage({
     <div className="settings-page">
       <SettingsCards settings={snapshot.settings} onSave={onSave}/>
       <PricingSettings pricing={snapshot.pricing} onRefresh={onRefresh} />
-      <ApplicationSettings version={snapshot.appVersion} />
+      <ApplicationSettings version={snapshot.appVersion} update={snapshot.update} onRefresh={onRefresh} />
       <StorageSettings snapshot={snapshot} onRefresh={onRefresh} />
       <section className="panel settings-panel">
         <div className="panel-title">
@@ -775,8 +794,12 @@ function SettingsPage({
           <b>Windows 当前用户 DPAPI 加密</b>
         </div>
         <div className="setting-line">
-          <span>后台上报 / 自动更新请求</span>
+          <span>后台上报</span>
           <b>未启用</b>
+        </div>
+        <div className="setting-line" data-update-privacy>
+          <span>版本更新检查</span>
+          <b>{native ? "访问 GitHub；不上传模型配置或 Key" : "浏览器预览不联网检查"}</b>
         </div>
         <div className="setting-line directory">
           <span>数据目录</span>

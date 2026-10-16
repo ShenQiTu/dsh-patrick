@@ -8,6 +8,7 @@ mod lifecycle;
 mod history;
 mod call_history;
 mod desktop_settings;
+mod update;
 mod dsh;
 #[cfg(test)]
 mod exit_tests;
@@ -21,6 +22,9 @@ use std::{
 use tauri::{Emitter, Manager};
 
 struct AppState {
+    updater: update::Service,
+    update_startup: Mutex<Option<update::replacement::Startup>>,
+    update_ready: std::sync::atomic::AtomicBool,
     dsh: Mutex<dsh::Status>,
     integration_control: tokio::sync::Mutex<()>,
     close_request: Mutex<Option<lifecycle::CloseRequest>>,
@@ -126,6 +130,7 @@ struct Snapshot {
     pricing: config::TokenPricing,
     data_directory: String,
     app_version: String,
+    update: update::View,
     test_mode: bool,
     gateway_running: bool,
     gateway_available: bool,
@@ -141,6 +146,8 @@ struct Snapshot {
 
 #[tauri::command]
 fn snapshot(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<Snapshot, String> {
+    // The replacement helper writes its final result after the new UI sends ready.
+    if !state.smoke {state.updater.read_last_result();}
     let dsh=state.dsh.lock().map_err(|_| "接入状态锁异常")?.clone();
     let store = state.store.lock().map_err(|_| "配置锁异常")?;
     Ok(Snapshot {
@@ -149,6 +156,7 @@ fn snapshot(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<Snap
         pricing: store.config.pricing.clone(),
         data_directory: state.directory.display().to_string(),
         app_version: env!("CARGO_PKG_VERSION").into(),
+        update: state.updater.view(),
         test_mode: state.smoke,
         gateway_running: state.gateway.running(),
         gateway_available: true,
@@ -294,9 +302,56 @@ fn autostart_status(state: tauri::State<AppState>) -> Result<desktop_settings::A
 #[tauri::command]
 fn set_autostart(state: tauri::State<AppState>, enabled: bool) -> Result<desktop_settings::AutostartStatus, String> { desktop_settings::set_autostart(&state.autostart_key, enabled) }
 #[tauri::command]
-async fn check_update(state: tauri::State<'_, AppState>) -> Result<desktop_settings::UpdateInfo, String> {
-    if state.smoke { return Err("自测模式不访问 GitHub；仓库未公开时将提示登录发布页查看".into()); }
-    desktop_settings::check_update().await
+async fn check_update(state: tauri::State<'_, AppState>, background: Option<bool>) -> Result<update::View, String> {
+    if state.smoke { return Err("自测模式不访问 GitHub".into()); }
+    if background.unwrap_or(false) && std::env::var("DSH_PATRICK_UPDATE_OFFLINE").as_deref()==Ok("1"){return Ok(state.updater.view());}
+    state.updater.check(background.unwrap_or(false)).await
+}
+#[tauri::command]
+fn cancel_update(state: tauri::State<AppState>) -> Result<(),String> { state.updater.cancel() }
+#[tauri::command]
+async fn install_update(app:tauri::AppHandle,state:tauri::State<'_,AppState>,expected_version:String)->Result<(),String>{
+    if state.smoke {return Err("自测模式不执行正式更新".into());}
+    update::version(&expected_version)?;
+    state.updater.begin()?;
+    tauri::async_runtime::spawn(async move {
+        let state=app.state::<AppState>();
+        let result:Result<(),String>=async {
+            let target=std::env::current_exe().map_err(|_|"读取当前程序路径失败")?;
+            let stage=state.updater.stage(&expected_version,&target).await?;
+            state.updater.phase("waiting","更新已下载；正在等待所有请求结束，可取消更新。");
+            loop {
+                state.updater.cancelled()?;
+                if state.gateway.runtime()?.active_requests>0 {tokio::time::sleep(std::time::Duration::from_millis(500)).await;continue;}
+                let _control=state.integration_control.lock().await;
+                let Ok(_pause)=state.gateway.pause_if_idle() else {drop(_control);tokio::time::sleep(std::time::Duration::from_millis(500)).await;continue;};
+                state.updater.cancelled()?;
+                state.updater.enter_installing()?;
+                let resume=state.gateway.running();
+                update::replacement::prepare(&stage,&target,&state.directory,resume)?;
+                let mut helper=update::replacement::spawn(&stage)?;
+                if let Err(e)=update::replacement::handshake(&mut helper,&stage).await {let _=helper.kill();let _=helper.wait();return Err(e);}
+                // Preserve DSH routes and journal during replacement. The new process
+                // reclaims the same data/profile only after this process has exited.
+                if let Err(e)=state.gateway.stop().await {let _=helper.kill();let _=helper.wait();return Err(e);}
+                app.exit(0);
+                std::future::pending::<()>().await; // keep admission/integration locked until process exit
+            }
+        }.await;
+        if let Err(e)=result {state.updater.finish_error(&e);}
+    });
+    Ok(())
+}
+#[tauri::command]
+fn update_ready(app:tauri::AppHandle,state:tauri::State<AppState>)->Result<bool,String>{
+    if !state.update_ready.load(std::sync::atomic::Ordering::SeqCst){return Ok(false);}
+    let mut pending=state.update_startup.lock().map_err(|_|"更新启动状态锁异常")?;
+    if let Some(start)=pending.as_ref() {
+        if std::env::var("DSH_PATRICK_UPDATE_HEADLESS").as_deref()!=Ok("1") {lifecycle::show(&app)?;}
+        update::replacement::signal_ready(start)?;
+        *pending=None;
+    }
+    Ok(true)
 }
 #[tauri::command]
 fn open_release_page(state: tauri::State<AppState>) -> Result<(), String> {
@@ -458,9 +513,13 @@ fn smoke_resize(app: tauri::AppHandle, state: tauri::State<AppState>, width: u32
 }
 
 fn main() {
+    if let Some(code)=update::replacement::run_if_requested(){std::process::exit(code);}
+    let update_startup=match update::replacement::startup(){Ok(s)=>s,Err(e)=>{eprintln!("UPDATE_STARTUP_FAILED: {e}");std::process::exit(4);}};
+    let updating=update_startup.is_some();
+    let resume_gateway=update_startup.as_ref().is_some_and(|s|s.ctx.plan.resume_gateway);
     let smoke = std::env::args().any(|a| a == "--ui-smoke-test");
-    let directory = std::env::var_os("DSH_PATRICK_DATA")
-        .map(PathBuf::from)
+    let directory = update_startup.as_ref().map(|s|s.ctx.plan.data_directory.clone())
+        .or_else(||std::env::var_os("DSH_PATRICK_DATA").map(PathBuf::from))
         .unwrap_or_else(|| {
             std::env::current_exe()
                 .unwrap()
@@ -479,18 +538,31 @@ fn main() {
     }
     let visual_review = smoke && std::env::var("DSH_PATRICK_SMOKE_SHOW").as_deref() == Ok("1");
     let result=tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,resolve_close,test_model,cancel_test,clear_records,call_detail,clear_call_details,save_pricing,statistics_storage,clear_statistics,autostart_status,set_autostart,check_update,open_release_page,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
+        .invoke_handler(tauri::generate_handler![snapshot,sync_dsh,check_dsh,save_model,delete_model,duplicate_model,save_settings,discover_models,start_gateway,stop_gateway,resolve_close,test_model,cancel_test,clear_records,call_detail,clear_call_details,save_pricing,statistics_storage,clear_statistics,autostart_status,set_autostart,check_update,install_update,cancel_update,update_ready,open_release_page,gateway_token,smoke_gateway_probe,smoke_finish,smoke_fail,smoke_resize,statistics,smoke_lifecycle])
         .setup(move|app|{
             let store=Arc::new(Mutex::new(Store::open(directory.clone()).map_err(std::io::Error::other)?));
             let gateway=gateway::Gateway::new(store.clone()).map_err(std::io::Error::other)?;
-            app.manage(AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke,autostart_key:if smoke {desktop_settings::test_key()} else {desktop_settings::STARTUP_KEY.into()},smoke_finished: std::sync::atomic::AtomicBool::new(false)});
+            let updater=update::Service::default();updater.read_last_result();
+            app.manage(AppState{updater,update_startup:Mutex::new(update_startup),update_ready:std::sync::atomic::AtomicBool::new(!updating),dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke,autostart_key:if smoke {desktop_settings::test_key()} else {desktop_settings::STARTUP_KEY.into()},smoke_finished: std::sync::atomic::AtomicBool::new(false)});
             tauri::WebviewWindowBuilder::new(app,"main",tauri::WebviewUrl::App("index.html".into()))
                 .title(if visual_review{format!("DSH Patrick v{} — 本机模拟验证",env!("CARGO_PKG_VERSION"))}else{format!("DSH Patrick v{}",env!("CARGO_PKG_VERSION"))}).inner_size(960.0,640.0).min_inner_size(800.0,520.0)
-                .decorations(false).visible(!smoke||visual_review).data_directory(webview)
+                .decorations(false).visible((!smoke||visual_review)&&!updating).data_directory(webview)
                 .additional_browser_args("--disable-background-networking --disable-component-update --disable-sync --no-first-run")
                 .on_navigation(|url|((url.scheme()=="http"||url.scheme()=="https")&&url.host_str()==Some("tauri.localhost")) || (url.scheme()=="http"&&url.host_str()==Some("127.0.0.1")&&url.port()==Some(1427)) || (url.scheme()=="tauri"&&url.host_str()==Some("localhost")))
                 .build()?;
             lifecycle::install(app.handle())?;
+            if updating {let handle=app.handle().clone();tauri::async_runtime::spawn(async move {
+                let state=handle.state::<AppState>();
+                let result=async {
+                    let _control=state.integration_control.lock().await;
+                    if resume_gateway {state.gateway.start().await?;state.bridge("sync").await?;}
+                    state.update_ready.store(true,std::sync::atomic::Ordering::SeqCst);Ok::<_,String>(())
+                }.await;
+                if let Err(error)=result {eprintln!("UPDATE_RESUME_FAILED: {error}");handle.exit(4);}
+            });}
+            if !smoke && std::env::var("DSH_PATRICK_UPDATE_OFFLINE").as_deref()!=Ok("1") {let handle=app.handle().clone();tauri::async_runtime::spawn(async move {
+                loop {let _=handle.state::<AppState>().updater.check(true).await;tokio::time::sleep(std::time::Duration::from_secs(6*60*60)).await;}
+            });}
             if !smoke { let handle=app.handle().clone(); tauri::async_runtime::spawn(async move {
                 let state=handle.state::<AppState>();
                 loop {
@@ -513,7 +585,7 @@ fn main() {
         })
         .run(tauri::generate_context!());
     if let Err(error) = result {
-        if smoke {
+        if smoke || updating {
             eprintln!("SMOKE_START_FAILED: {error}");
         } else {
             vault::show_error(&format!("DSH Patrick 启动失败：{error}"));

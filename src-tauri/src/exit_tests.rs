@@ -47,7 +47,7 @@ async fn exit_foreign_profile_does_not_block_or_restore_other_copy() {
             "headers":{},"enabled":true,"reasoning":"default","prompt":""
         })).unwrap()).unwrap();
         let store=Arc::new(Mutex::new(store));let gateway=gateway::Gateway::new(store.clone()).unwrap();
-        AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke:false,autostart_key:String::new(),smoke_finished:std::sync::atomic::AtomicBool::new(false)}
+        AppState{updater:update::Service::default(),update_startup:Mutex::new(None),update_ready:std::sync::atomic::AtomicBool::new(true),dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke:false,autostart_key:String::new(),smoke_finished:std::sync::atomic::AtomicBool::new(false)}
     }
     let old=state(root.join("old-data"),&profile);
     let new=state(root.join("new-data"),&profile);
@@ -84,7 +84,7 @@ async fn recovery_fixture() -> (AppState, PathBuf) {
     let mut settings=store.config.settings.clone();settings.dsh_profile=profile.display().to_string();store.settings(settings).unwrap();
     store.save(serde_json::from_value(serde_json::json!({"name":"Synthetic recovery fixture","model":"mock","protocol":"openai","baseUrl":"http://127.0.0.1:9/v1","apiKey":"SYNTHETIC_KEY","headers":{},"enabled":true,"reasoning":"default","prompt":""})).unwrap()).unwrap();
     let store=Arc::new(Mutex::new(store));let gateway=gateway::Gateway::new(store.clone()).unwrap();
-    let state=AppState{dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke:false,autostart_key:String::new(),smoke_finished:std::sync::atomic::AtomicBool::new(false)};
+    let state=AppState{updater:update::Service::default(),update_startup:Mutex::new(None),update_ready:std::sync::atomic::AtomicBool::new(true),dsh:Mutex::new(dsh::Status::default()),integration_control:tokio::sync::Mutex::new(()),close_request:Mutex::new(None),store,gateway,directory,smoke:false,autostart_key:String::new(),smoke_finished:std::sync::atomic::AtomicBool::new(false)};
     state.gateway.start_at(0).await.unwrap();state.bridge("sync").await.unwrap();
     let file=profile.join("cordis.patch.yml");let text=std::fs::read_to_string(&file).unwrap();
     assert!(text.contains("DSH Patrick · openai"));std::fs::write(&file,text.replace("DSH Patrick · openai","externally-edited-provider")).unwrap();
